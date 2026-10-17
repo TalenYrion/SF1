@@ -1,50 +1,81 @@
 export const WIDTH = 800;
 export const HEIGHT = 600;
-export const RADIUS = 50;
-export const SPEED = 5; // pixels per tick (5 x 60 = 300 px/s)
 export const TICK_RATE = 60;
 
 // Input bitmask
 export const Input = { UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8 } as const;
 
-export type PlayerState = { x: number; y: number };
 export type GameState = { frame: number; players: [PlayerState, PlayerState] };
 export type Inputs = [number, number]; // one bitmask per player
+
+export const GROUND_Y = 500; // y of the fighters' feet
+export const FIGHTER_W = 60;
+export const FIGHTER_H = 120;
+const HALF_W = FIGHTER_W / 2;
+const WALK_SPEED = 5; // pixels per tick
+const JUMP_V = -24; // upward speed at takeoff
+const GRAVITY = 2; // added to vy every tick
+
+export type PlayerState = { x: number; y: number; vy: number; facing: 1 | -1 };
 
 export function createInitialState(): GameState {
   return {
     frame: 0,
     players: [
-      { x: 200, y: 300 },
-      { x: 600, y: 300 },
+      { x: 250, y: GROUND_Y, vy: 0, facing: 1 },
+      { x: 550, y: GROUND_Y, vy: 0, facing: -1 },
     ],
   };
 }
 
-const clamp = (v: number, min: number, max: number) =>
-  Math.min(Math.max(v, min), max);
+function move(p: PlayerState, other: PlayerState, input: number): PlayerState {
+  let { x, y, vy } = p;
 
-export function step(state: GameState, inputs: Inputs): GameState {
-  const players = state.players.map((p, i) => {
-    const input = inputs[i];
-    let x = p.x;
-    let y = p.y;
+  if (y === GROUND_Y && input & Input.UP) vy = JUMP_V;
+  if (input & Input.LEFT) x -= WALK_SPEED;
+  if (input & Input.RIGHT) x += WALK_SPEED;
 
-    if (input & Input.LEFT) x -= SPEED;
-    if (input & Input.RIGHT) x += SPEED;
-    if (input & Input.UP) y -= SPEED;
-    if (input & Input.DOWN) y += SPEED;
+  y += vy;
+  vy += GRAVITY;
+  if (y >= GROUND_Y) {
+    y = GROUND_Y;
+    vy = 0;
+  }
+  x = clamp(x, HALF_W, WIDTH - HALF_W);
 
-    return {
-      x: clamp(x, RADIUS, WIDTH - RADIUS),
-      y: clamp(y, RADIUS, HEIGHT - RADIUS),
-    };
-  }) as [PlayerState, PlayerState];
+  // Face the opponent while on the ground; keep facing in the air
+  let facing = p.facing;
+  if (y === GROUND_Y) {
+    if (other.x > x) facing = 1;
+    else if (other.x < x) facing = -1;
+  }
 
-  return { frame: state.frame + 1, players };
+  return { x, y, vy, facing };
 }
 
-// FNV-style hash of the state. Positions are integers, so both machines get the same number.
+// Push overlapping fighters apart sideways (they can still jump over each other)
+function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
+  const dx = b.x - a.x;
+  const overlapX = FIGHTER_W - Math.abs(dx);
+  const overlapY = FIGHTER_H - Math.abs(a.y - b.y);
+  if (overlapX <= 0 || overlapY <= 0) return [a, b];
+
+  const dir = dx >= 0 ? 1 : -1;
+  const pushA = overlapX >> 1;
+  const pushB = overlapX - pushA;
+  return [
+    { ...a, x: clamp(a.x - dir * pushA, HALF_W, WIDTH - HALF_W) },
+    { ...b, x: clamp(b.x + dir * pushB, HALF_W, WIDTH - HALF_W) },
+  ];
+}
+
+export function step(state: GameState, inputs: Inputs): GameState {
+  const [a, b] = state.players;
+  const [pa, pb] = separate(move(a, b, inputs[0]), move(b, a, inputs[1]));
+  return { frame: state.frame + 1, players: [pa, pb] };
+}
+
+// The checksum must hash EVERY field of the state, or desyncs in the missing ones go unnoticed
 export function checksum(s: GameState): number {
   let h = 2166136261;
   const mix = (n: number) => {
@@ -55,6 +86,11 @@ export function checksum(s: GameState): number {
   for (const p of s.players) {
     mix(p.x);
     mix(p.y);
+    mix(p.vy);
+    mix(p.facing);
   }
   return h >>> 0;
 }
+
+const clamp = (v: number, min: number, max: number) =>
+  Math.min(Math.max(v, min), max);

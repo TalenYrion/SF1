@@ -4,7 +4,9 @@ import Phaser from 'phaser';
 import {
   WIDTH,
   HEIGHT,
-  RADIUS,
+  FIGHTER_W,
+  FIGHTER_H,
+  GROUND_Y,
   TICK_RATE,
   Input,
   createInitialState,
@@ -65,7 +67,8 @@ setInterval(() => {
 class MainScene extends Phaser.Scene {
   private state: GameState = createInitialState();
   private accumulator = 0;
-  private circles: Phaser.GameObjects.Arc[] = [];
+  private bodies: Phaser.GameObjects.Rectangle[] = [];
+  private faces: Phaser.GameObjects.Rectangle[] = [];
   private hud!: Phaser.GameObjects.Text;
   private wasd!: WASDKeys;
   private arrows!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -76,9 +79,20 @@ class MainScene extends Phaser.Scene {
     this.wasd = kb.addKeys('W,A,S,D') as WASDKeys;
     this.arrows = kb.createCursorKeys();
 
-    this.circles = [
-      this.add.circle(0, 0, RADIUS, 0xff0000),
-      this.add.circle(0, 0, RADIUS, 0x00aaff),
+    this.add
+      .rectangle(WIDTH / 2, GROUND_Y, WIDTH, 4, 0x888888)
+      .setOrigin(0.5, 0);
+    this.bodies = [
+      this.add
+        .rectangle(0, 0, FIGHTER_W, FIGHTER_H, 0xff0000)
+        .setOrigin(0.5, 1),
+      this.add
+        .rectangle(0, 0, FIGHTER_W, FIGHTER_H, 0x00aaff)
+        .setOrigin(0.5, 1),
+    ];
+    this.faces = [
+      this.add.rectangle(0, 0, 14, 14, 0xffffff),
+      this.add.rectangle(0, 0, 14, 14, 0xffffff),
     ];
     this.hud = this.add.text(10, 10, '', {
       fontSize: '14px',
@@ -135,11 +149,13 @@ class MainScene extends Phaser.Scene {
   }
 
   private render(state: GameState): void {
-    state.players.forEach((p, i) => this.circles[i].setPosition(p.x, p.y));
-
+    state.players.forEach((p, i) => {
+      this.bodies[i].setPosition(p.x, p.y);
+      this.faces[i].setPosition(p.x + p.facing * 16, p.y - FIGHTER_H + 24);
+    });
     const mine = session ? session.localIndex : -1;
     if (mine !== this.highlighted) {
-      this.circles.forEach((c, i) =>
+      this.bodies.forEach((c, i) =>
         c.setStrokeStyle(i === mine ? 4 : 0, 0xffffff),
       );
       this.highlighted = mine;
