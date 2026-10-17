@@ -2,7 +2,14 @@ export const WIDTH = 800;
 export const HEIGHT = 600;
 export const TICK_RATE = 60;
 
-export const Input = { UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8, ATTACK: 16 } as const;
+export const Input = {
+  UP: 1,
+  DOWN: 2,
+  LEFT: 4,
+  RIGHT: 8,
+  ATTACK: 16,
+  DODGE: 32,
+} as const;
 
 export const GROUND_Y = 500;
 export const FIGHTER_W = 60;
@@ -11,39 +18,62 @@ const HALF_W = FIGHTER_W / 2;
 const WALK_SPEED = 5;
 const JUMP_V = -24;
 const GRAVITY = 2;
+export const RESTART_TICKS = 180; // 3 seconds between a KO and the next round
 
 export const MAX_HP = 100;
-export const ATTACK_STARTUP = 5;
-export const ATTACK_ACTIVE = 3;
-const ATTACK_RECOVERY = 12;
+
+// Attack frame data (ticks)
+export const ATTACK_STARTUP = 14;
+export const ATTACK_ACTIVE = 4;
+const ATTACK_RECOVERY = 20;
 const ATTACK_TOTAL = ATTACK_STARTUP + ATTACK_ACTIVE + ATTACK_RECOVERY;
-export const ATTACK_REACH = 55; // how far the hitbox extends past the fighter's edge
+export const ATTACK_REACH = 55;
 export const ATTACK_H = 40;
-const ATTACK_TOP = 90; // hitbox top, in pixels above the feet
+const ATTACK_TOP = 90;
 const DAMAGE = 10;
-const HITSTUN = 18; // ticks a hit fighter can't act
-const KNOCKBACK = 8; // starting push speed, shrinks by 1 per tick
+const HITSTUN = 18;
+const KNOCKBACK = 8;
+
+// Block
+const CHIP_DAMAGE = 2;
+const BLOCKSTUN = 4;
+const BLOCK_KNOCKBACK = 4;
+
+// Dodge
+export const DODGE_INVULN = 12; // ticks with no hurtbox
+const DODGE_TOTAL = 18; // invulnerable ticks plus vulnerable recovery
+const DODGE_MOVE = 8; // ticks spent moving backward
+const DODGE_SPEED = 4; // pixels per tick
 
 export const ACT_FREE = 0;
 export const ACT_ATTACK = 1;
 export const ACT_HITSTUN = 2;
+export const ACT_BLOCK = 3;
+export const ACT_BLOCKSTUN = 4;
+export const ACT_DODGE = 5;
 
 export type PlayerState = {
   x: number;
   y: number;
-  vy: number; // vertical speed
-  vx: number; // knockback speed (only used in hitstun)
+  vy: number;
+  vx: number;
   facing: 1 | -1;
   hp: number;
-  act: number; // ACT_FREE, ACT_ATTACK or ACT_HITSTUN
-  t: number; // ticks spent in the current action
-  hit: 0 | 1; // has the current attack already connected?
+  act: number;
+  t: number;
+  hit: 0 | 1;
 };
-export type GameState = { frame: number; players: [PlayerState, PlayerState] };
+export type GameState = {
+  frame: number;
+  players: [PlayerState, PlayerState];
+  over: number; // 0 = fighting, otherwise ticks since the KO
+  winner: number; // -1 = none, 0 or 1 = that player, 2 = draw
+  wins: [number, number];
+};
 export type Inputs = [number, number];
 export type Box = { left: number; right: number; top: number; bottom: number };
 
-export function createInitialState(): GameState {
+export function createInitialState(wins: [number, number] = [0, 0]): GameState {
   const base = {
     y: GROUND_Y,
     vy: 0,
@@ -59,6 +89,9 @@ export function createInitialState(): GameState {
       { ...base, x: 250, facing: 1 },
       { ...base, x: 550, facing: -1 },
     ],
+    over: 0,
+    winner: -1,
+    wins,
   };
 }
 
@@ -76,7 +109,6 @@ export function hurtbox(p: PlayerState): Box {
   };
 }
 
-/** The attack hitbox, only during the active frames (null otherwise) */
 export function attackBox(p: PlayerState): Box | null {
   if (p.act !== ACT_ATTACK) return null;
   if (p.t < ATTACK_STARTUP || p.t >= ATTACK_STARTUP + ATTACK_ACTIVE)
@@ -102,14 +134,24 @@ function moveFighter(
   input: number,
 ): PlayerState {
   let { x, y, vy, vx, facing, act, t, hit } = p;
+  const grounded = y === GROUND_Y;
 
-  if (act === ACT_FREE) {
-    if (y === GROUND_Y && input & Input.ATTACK) {
+  if (act === ACT_FREE || act === ACT_BLOCK) {
+    // Priority: dodge, then attack, then block, then normal movement
+    if (grounded && input & Input.DODGE) {
+      act = ACT_DODGE;
+      t = 0;
+    } else if (grounded && input & Input.ATTACK) {
       act = ACT_ATTACK;
       t = 0;
       hit = 0;
+    } else if (grounded && input & Input.DOWN) {
+      act = ACT_BLOCK;
+      t = 0;
     } else {
-      if (y === GROUND_Y && input & Input.UP) vy = JUMP_V;
+      act = ACT_FREE;
+      t = 0;
+      if (grounded && input & Input.UP) vy = JUMP_V;
       if (input & Input.LEFT) x -= WALK_SPEED;
       if (input & Input.RIGHT) x += WALK_SPEED;
     }
@@ -120,19 +162,26 @@ function moveFighter(
       t = 0;
       hit = 0;
     }
+  } else if (act === ACT_DODGE) {
+    if (t < DODGE_MOVE) x -= facing * DODGE_SPEED; // backward = away from where we face
+    t++;
+    if (t >= DODGE_TOTAL) {
+      act = ACT_FREE;
+      t = 0;
+    }
   } else {
-    // hitstun: pushed back, can't act
+    // hitstun or blockstun: pushed back, can't act
     x += vx;
     vx -= Math.sign(vx);
     t++;
-    if (t >= HITSTUN) {
+    const duration = act === ACT_HITSTUN ? HITSTUN : BLOCKSTUN;
+    if (t >= duration) {
       act = ACT_FREE;
       t = 0;
       vx = 0;
     }
   }
 
-  // Gravity always applies
   y += vy;
   vy += GRAVITY;
   if (y >= GROUND_Y) {
@@ -141,7 +190,6 @@ function moveFighter(
   }
   x = clamp(x, HALF_W, WIDTH - HALF_W);
 
-  // Face the opponent, but only while free and on the ground
   if (act === ACT_FREE && y === GROUND_Y) {
     if (other.x > x) facing = 1;
     else if (other.x < x) facing = -1;
@@ -150,7 +198,6 @@ function moveFighter(
   return { x, y, vy, vx, facing, hp: p.hp, act, t, hit };
 }
 
-// Push overlapping fighters apart sideways (they can still jump over each other)
 function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
   const dx = b.x - a.x;
   const overlapX = FIGHTER_W - Math.abs(dx);
@@ -168,12 +215,21 @@ function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
 
 // ---------- hits ----------
 
+function canBeHit(d: PlayerState): boolean {
+  if (d.act === ACT_HITSTUN) return false;
+  if (d.act === ACT_DODGE && d.t < DODGE_INVULN) return false; // invulnerable
+  return true;
+}
+
+const isBlocking = (d: PlayerState) =>
+  d.act === ACT_BLOCK || d.act === ACT_BLOCKSTUN;
+
 function landed(attacker: PlayerState, defender: PlayerState): boolean {
   const box = attackBox(attacker);
   return (
     box !== null &&
     attacker.hit === 0 &&
-    defender.act !== ACT_HITSTUN &&
+    canBeHit(defender) &&
     overlaps(box, hurtbox(defender))
   );
 }
@@ -189,34 +245,63 @@ function takeHit(victim: PlayerState, attacker: PlayerState): PlayerState {
   };
 }
 
+function takeBlock(victim: PlayerState, attacker: PlayerState): PlayerState {
+  return {
+    ...victim,
+    hp: Math.max(0, victim.hp - CHIP_DAMAGE),
+    act: ACT_BLOCKSTUN,
+    t: 0,
+    vx: attacker.facing * BLOCK_KNOCKBACK,
+    hit: 0,
+  };
+}
+
 // ---------- the whole game, one tick ----------
 
 export function step(state: GameState, inputs: Inputs): GameState {
+  const roundOver = state.over > 0;
+
+  if (roundOver && state.over >= RESTART_TICKS) {
+    // New round. The frame counter keeps counting, because rollback indexes history by frame.
+    return { ...createInitialState(state.wins), frame: state.frame + 1 };
+  }
+
+  // After a KO nobody can act, but fighters finish falling and being pushed back
+  const live: Inputs = roundOver ? [0, 0] : inputs;
   const [a0, b0] = state.players;
   const [a, b] = separate(
-    moveFighter(a0, b0, inputs[0]),
-    moveFighter(b0, a0, inputs[1]),
+    moveFighter(a0, b0, live[0]),
+    moveFighter(b0, a0, live[1]),
   );
-
-  // Both hits are decided from the same positions, so a trade is possible
-  const aHits = landed(a, b);
-  const bHits = landed(b, a);
 
   let na = a;
   let nb = b;
-  if (aHits) {
-    nb = takeHit(nb, a);
-    na = { ...na, hit: 1 };
-  }
-  if (bHits) {
-    na = takeHit(na, b);
-    nb = { ...nb, hit: 1 };
+  if (!roundOver) {
+    const aHits = landed(a, b);
+    const bHits = landed(b, a);
+    if (aHits) {
+      nb = isBlocking(b) ? takeBlock(b, a) : takeHit(b, a);
+      na = { ...na, hit: 1 };
+    }
+    if (bHits) {
+      na = isBlocking(a) ? takeBlock(a, b) : takeHit(a, b);
+      nb = { ...nb, hit: 1 };
+    }
   }
 
-  return { frame: state.frame + 1, players: [na, nb] };
+  let { over, winner, wins } = state;
+  if (roundOver) {
+    over++;
+  } else if (na.hp <= 0 || nb.hp <= 0) {
+    over = 1;
+    winner = na.hp <= 0 && nb.hp <= 0 ? 2 : na.hp <= 0 ? 1 : 0;
+    if (winner === 0) wins = [wins[0] + 1, wins[1]];
+    else if (winner === 1) wins = [wins[0], wins[1] + 1];
+  }
+
+  return { frame: state.frame + 1, players: [na, nb], over, winner, wins };
 }
 
-// The checksum hashes EVERY field of the state
 export function checksum(s: GameState): number {
   let h = 2166136261;
   const mix = (n: number) => {
@@ -234,6 +319,10 @@ export function checksum(s: GameState): number {
     mix(p.act);
     mix(p.t);
     mix(p.hit);
+    mix(s.over);
+    mix(s.winner);
+    mix(s.wins[0]);
+    mix(s.wins[1]);
   }
   return h >>> 0;
 }

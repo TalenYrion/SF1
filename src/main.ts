@@ -14,6 +14,10 @@ import {
   ATTACK_H,
   ACT_ATTACK,
   ACT_HITSTUN,
+  ACT_BLOCK,
+  ACT_BLOCKSTUN,
+  ACT_DODGE,
+  DODGE_INVULN,
   createInitialState,
   step,
   attackBox,
@@ -22,7 +26,10 @@ import {
 import { Rollback } from './rollback';
 import { joinRoom, socket, startPeer, closePeer, sendToPeer } from './net';
 
-type WASDKeys = Record<'W' | 'A' | 'S' | 'D' | 'F', Phaser.Input.Keyboard.Key>;
+type WASDKeys = Record<
+  'W' | 'A' | 'S' | 'D' | 'F' | 'G',
+  Phaser.Input.Keyboard.Key
+>;
 
 const TICK_MS = 1000 / TICK_RATE;
 const LIVENESS_TIMEOUT = 5000;
@@ -79,13 +86,15 @@ class MainScene extends Phaser.Scene {
   private atkBoxes: Phaser.GameObjects.Rectangle[] = [];
   private hpBars: Phaser.GameObjects.Rectangle[] = [];
   private hud!: Phaser.GameObjects.Text;
+  private banner!: Phaser.GameObjects.Text;
+  private score!: Phaser.GameObjects.Text;
   private wasd!: WASDKeys;
   private arrows!: Phaser.Types.Input.Keyboard.CursorKeys;
   private highlighted = -1;
 
   create(): void {
     const kb = this.input.keyboard!;
-    this.wasd = kb.addKeys('W,A,S,D,F') as WASDKeys;
+    this.wasd = kb.addKeys('W,A,S,D,F,G') as WASDKeys;
     this.arrows = kb.createCursorKeys();
 
     this.add
@@ -125,6 +134,16 @@ class MainScene extends Phaser.Scene {
       fontSize: '14px',
       color: '#ffffff',
     });
+    this.score = this.add
+      .text(WIDTH / 2, 30, '0  -  0', { fontSize: '28px', color: '#ffffff' })
+      .setOrigin(0.5, 0);
+    this.banner = this.add
+      .text(WIDTH / 2, 220, '', {
+        fontSize: '56px',
+        color: '#ffdd44',
+        fontStyle: 'bold',
+      })
+      .setOrigin(0.5);
     this.render(this.state);
   }
 
@@ -165,6 +184,7 @@ class MainScene extends Phaser.Scene {
     if (this.wasd.A.isDown) input |= Input.LEFT;
     if (this.wasd.D.isDown) input |= Input.RIGHT;
     if (this.wasd.F.isDown) input |= Input.ATTACK;
+    if (this.wasd.G.isDown) input |= Input.DODGE;
     return input;
   }
 
@@ -176,6 +196,7 @@ class MainScene extends Phaser.Scene {
     if (this.arrows.left.isDown) input |= Input.LEFT;
     if (this.arrows.right.isDown) input |= Input.RIGHT;
     if (this.arrows.space.isDown) input |= Input.ATTACK;
+    if (this.arrows.shift.isDown) input |= Input.DODGE;
     return input;
   }
 
@@ -183,14 +204,18 @@ class MainScene extends Phaser.Scene {
     state.players.forEach((p, i) => {
       // Colour shows the phase: orange = startup, yellow = active, grey = recovery, white = hit
       let color = BASE_COLORS[i];
+      let alpha = 1;
       if (p.act === ACT_HITSTUN) color = 0xffffff;
+      else if (p.act === ACT_BLOCK) color = 0x33ddaa;
+      else if (p.act === ACT_BLOCKSTUN) color = 0x99ffdd;
+      else if (p.act === ACT_DODGE) alpha = p.t < DODGE_INVULN ? 0.3 : 0.7;
       else if (p.act === ACT_ATTACK) {
         if (p.t < ATTACK_STARTUP) color = 0xffaa00;
         else if (p.t < ATTACK_STARTUP + ATTACK_ACTIVE) color = 0xffff00;
         else color = 0x888888;
       }
 
-      this.bodies[i].setPosition(p.x, p.y).setFillStyle(color);
+      this.bodies[i].setPosition(p.x, p.y).setFillStyle(color).setAlpha(alpha);
       this.faces[i].setPosition(p.x + p.facing * 16, p.y - FIGHTER_H + 24);
 
       const box = attackBox(p);
@@ -204,6 +229,15 @@ class MainScene extends Phaser.Scene {
 
       this.hpBars[i].setScale(p.hp / MAX_HP, 1);
     });
+
+    this.score.setText(`${state.wins[0]}  -  ${state.wins[1]}`);
+    this.banner.setText(
+      state.over > 0
+        ? state.winner === 2
+          ? 'DRAW'
+          : `KO! ${state.winner === 0 ? 'RED' : 'BLUE'} WINS`
+        : '',
+    );
 
     const mine = session ? session.localIndex : -1;
     if (mine !== this.highlighted) {
