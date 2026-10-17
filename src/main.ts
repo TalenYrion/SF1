@@ -1,25 +1,32 @@
-//stage 6
-
 import Phaser from 'phaser';
 import {
   WIDTH,
   HEIGHT,
+  TICK_RATE,
+  Input,
   FIGHTER_W,
   FIGHTER_H,
   GROUND_Y,
-  TICK_RATE,
-  Input,
+  MAX_HP,
+  ATTACK_STARTUP,
+  ATTACK_ACTIVE,
+  ATTACK_REACH,
+  ATTACK_H,
+  ACT_ATTACK,
+  ACT_HITSTUN,
   createInitialState,
   step,
+  attackBox,
   type GameState,
 } from './sim';
 import { Rollback } from './rollback';
 import { joinRoom, socket, startPeer, closePeer, sendToPeer } from './net';
 
-type WASDKeys = Record<'W' | 'A' | 'S' | 'D', Phaser.Input.Keyboard.Key>;
+type WASDKeys = Record<'W' | 'A' | 'S' | 'D' | 'F', Phaser.Input.Keyboard.Key>;
 
 const TICK_MS = 1000 / TICK_RATE;
-const LIVENESS_TIMEOUT = 5000; // ms of silence before we declare the connection lost
+const LIVENESS_TIMEOUT = 5000;
+const BASE_COLORS = [0xff0000, 0x00aaff];
 
 const params = new URLSearchParams(location.search);
 const room = params.get('room');
@@ -43,7 +50,7 @@ let lastHeard = 0;
 function handleMessage(data: string): void {
   lastHeard = performance.now();
   if (data[0] === 'P') {
-    send('O' + data.slice(1)); // echo the timestamp back
+    send('O' + data.slice(1));
     return;
   }
   if (data[0] === 'O') {
@@ -69,6 +76,8 @@ class MainScene extends Phaser.Scene {
   private accumulator = 0;
   private bodies: Phaser.GameObjects.Rectangle[] = [];
   private faces: Phaser.GameObjects.Rectangle[] = [];
+  private atkBoxes: Phaser.GameObjects.Rectangle[] = [];
+  private hpBars: Phaser.GameObjects.Rectangle[] = [];
   private hud!: Phaser.GameObjects.Text;
   private wasd!: WASDKeys;
   private arrows!: Phaser.Types.Input.Keyboard.CursorKeys;
@@ -76,24 +85,42 @@ class MainScene extends Phaser.Scene {
 
   create(): void {
     const kb = this.input.keyboard!;
-    this.wasd = kb.addKeys('W,A,S,D') as WASDKeys;
+    this.wasd = kb.addKeys('W,A,S,D,F') as WASDKeys;
     this.arrows = kb.createCursorKeys();
 
     this.add
       .rectangle(WIDTH / 2, GROUND_Y, WIDTH, 4, 0x888888)
       .setOrigin(0.5, 0);
+
+    // Health bars: dark background, then the coloured bar on top
+    this.add.rectangle(20, 36, 300, 16, 0x444444).setOrigin(0, 0);
+    this.add.rectangle(WIDTH - 20, 36, 300, 16, 0x444444).setOrigin(1, 0);
+    this.hpBars = [
+      this.add.rectangle(20, 36, 300, 16, 0x22cc55).setOrigin(0, 0),
+      this.add.rectangle(WIDTH - 20, 36, 300, 16, 0x22cc55).setOrigin(1, 0),
+    ];
+
     this.bodies = [
       this.add
-        .rectangle(0, 0, FIGHTER_W, FIGHTER_H, 0xff0000)
+        .rectangle(0, 0, FIGHTER_W, FIGHTER_H, BASE_COLORS[0])
         .setOrigin(0.5, 1),
       this.add
-        .rectangle(0, 0, FIGHTER_W, FIGHTER_H, 0x00aaff)
+        .rectangle(0, 0, FIGHTER_W, FIGHTER_H, BASE_COLORS[1])
         .setOrigin(0.5, 1),
     ];
     this.faces = [
       this.add.rectangle(0, 0, 14, 14, 0xffffff),
       this.add.rectangle(0, 0, 14, 14, 0xffffff),
     ];
+    this.atkBoxes = [
+      this.add
+        .rectangle(0, 0, ATTACK_REACH, ATTACK_H, 0xffff00, 0.5)
+        .setVisible(false),
+      this.add
+        .rectangle(0, 0, ATTACK_REACH, ATTACK_H, 0xffff00, 0.5)
+        .setVisible(false),
+    ];
+
     this.hud = this.add.text(10, 10, '', {
       fontSize: '14px',
       color: '#ffffff',
@@ -130,29 +157,54 @@ class MainScene extends Phaser.Scene {
     }
   }
 
+  // WASD to move (W jumps), F to attack
   private readP1(): number {
     let input = 0;
     if (this.wasd.W.isDown) input |= Input.UP;
     if (this.wasd.S.isDown) input |= Input.DOWN;
     if (this.wasd.A.isDown) input |= Input.LEFT;
     if (this.wasd.D.isDown) input |= Input.RIGHT;
+    if (this.wasd.F.isDown) input |= Input.ATTACK;
     return input;
   }
 
+  // Arrows to move (Up jumps), Space to attack
   private readP2(): number {
     let input = 0;
     if (this.arrows.up.isDown) input |= Input.UP;
     if (this.arrows.down.isDown) input |= Input.DOWN;
     if (this.arrows.left.isDown) input |= Input.LEFT;
     if (this.arrows.right.isDown) input |= Input.RIGHT;
+    if (this.arrows.space.isDown) input |= Input.ATTACK;
     return input;
   }
 
   private render(state: GameState): void {
     state.players.forEach((p, i) => {
-      this.bodies[i].setPosition(p.x, p.y);
+      // Colour shows the phase: orange = startup, yellow = active, grey = recovery, white = hit
+      let color = BASE_COLORS[i];
+      if (p.act === ACT_HITSTUN) color = 0xffffff;
+      else if (p.act === ACT_ATTACK) {
+        if (p.t < ATTACK_STARTUP) color = 0xffaa00;
+        else if (p.t < ATTACK_STARTUP + ATTACK_ACTIVE) color = 0xffff00;
+        else color = 0x888888;
+      }
+
+      this.bodies[i].setPosition(p.x, p.y).setFillStyle(color);
       this.faces[i].setPosition(p.x + p.facing * 16, p.y - FIGHTER_H + 24);
+
+      const box = attackBox(p);
+      if (box) {
+        this.atkBoxes[i]
+          .setPosition((box.left + box.right) / 2, (box.top + box.bottom) / 2)
+          .setVisible(true);
+      } else {
+        this.atkBoxes[i].setVisible(false);
+      }
+
+      this.hpBars[i].setScale(p.hp / MAX_HP, 1);
     });
+
     const mine = session ? session.localIndex : -1;
     if (mine !== this.highlighted) {
       this.bodies.forEach((c, i) =>
@@ -204,6 +256,5 @@ if (room) {
     endSession('Opponent left. Waiting for a new opponent...');
   });
 
-  // Test helper
   (window as any).breakSim = () => session?.debugCorrupt();
 }
