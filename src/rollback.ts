@@ -8,7 +8,11 @@ import {
   type Inputs,
 } from './sim';
 
-type InputPacket = { f: number; i: number[]; s?: [number, number] };
+type InputPacket = { f: number; i: number[]; s?: [number, number]; a?: number };
+
+const DRIFT_DEADZONE = 1; // ticks of lead we ignore
+const DRIFT_GAIN = 0.04; // slowdown per tick of lead beyond the deadzone
+const MAX_SLOWDOWN = 0.08; // never slow down by more than 8%
 const CHECK_INTERVAL = 30; // compare checksums every 30 frames (twice a second)
 
 export const INPUT_DELAY = 1; // frames. Lockstep needed 3, rollback can use 0-2
@@ -36,6 +40,8 @@ export class Rollback {
   private theirSums = new Map<number, number>();
   private nextCheck = CHECK_INTERVAL;
   private latestSum: [number, number] | null = null;
+  private driftAvg = 0; // smoothed (my lead - their lead)
+  private lastLeadFrame = -1; // newest packet we took a lead reading from
   desyncFrame: number | null = null;
   // Debug stats
   rollbackCount = 0;
@@ -55,6 +61,22 @@ export class Rollback {
   /** How many frames we are running ahead of confirmed opponent input */
   get framesAhead(): number {
     return Math.max(0, this.state.frame - 1 - this.confirmed);
+  }
+
+  /** Unclamped: how far ahead of confirmed opponent input we are (can be negative) */
+  private get lead(): number {
+    return this.state.frame - 1 - this.confirmed;
+  }
+
+  /** Estimated ticks my clock is ahead of the opponent's (negative = I'm behind) */
+  get drift(): number {
+    return this.driftAvg / 2;
+  }
+
+  /** Tick duration multiplier: 1 = normal, above 1 = run slower so the opponent can catch up */
+  get slowdown(): number {
+    const over = this.drift - DRIFT_DEADZONE;
+    return over > 0 ? 1 + Math.min(MAX_SLOWDOWN, over * DRIFT_GAIN) : 1;
   }
 
   /** Try to run one tick. Returns false only if we're too far ahead and must wait. */
@@ -116,6 +138,15 @@ export class Rollback {
     });
 
     while (this.remote.has(this.confirmed + 1)) this.confirmed++;
+    // Compare my lead with theirs. Newer packets only, so re-sent copies don't count twice.
+    if (
+      typeof p.a === 'number' &&
+      Number.isFinite(p.a) &&
+      p.f > this.lastLeadFrame
+    ) {
+      this.lastLeadFrame = p.f;
+      this.driftAvg += (this.lead - p.a - this.driftAvg) * 0.05; // smoothed, so jitter doesn't cause wobble
+    }
   }
 
   /** Called while stalled so a dropped packet can't deadlock both sides */
@@ -169,6 +200,7 @@ export class Rollback {
     this.lastPacket = JSON.stringify({
       f: newest,
       i: list,
+      a: this.lead,
       ...(this.latestSum ? { s: this.latestSum } : {}),
     } satisfies InputPacket);
     this.send(this.lastPacket);

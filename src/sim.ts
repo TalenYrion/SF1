@@ -18,6 +18,7 @@ const HALF_W = FIGHTER_W / 2;
 const WALK_SPEED = 5;
 const JUMP_V = -24;
 const GRAVITY = 2;
+const ATTACK_BUFFER = 6; // ticks an early attack press is remembered
 export const RESTART_TICKS = 180; // 3 seconds between a KO and the next round
 
 export const MAX_HP = 100;
@@ -62,6 +63,8 @@ export type PlayerState = {
   act: number;
   t: number;
   hit: 0 | 1;
+  prev: number; // last tick's input, used to detect fresh key presses
+  buf: number; // ticks left on a buffered attack press
 };
 export type GameState = {
   frame: number;
@@ -82,6 +85,8 @@ export function createInitialState(wins: [number, number] = [0, 0]): GameState {
     act: ACT_FREE,
     t: 0,
     hit: 0 as const,
+    prev: 0,
+    buf: 0,
   };
   return {
     frame: 0,
@@ -133,18 +138,26 @@ function moveFighter(
   other: PlayerState,
   input: number,
 ): PlayerState {
-  let { x, y, vy, vx, facing, act, t, hit } = p;
+  let { x, y, vy, vx, facing, act, t, hit, buf } = p;
   const grounded = y === GROUND_Y;
+
+  // A press is a key that is down now but was not down last tick
+  const attackPressed =
+    (input & Input.ATTACK) !== 0 && (p.prev & Input.ATTACK) === 0;
+  const dodgePressed =
+    (input & Input.DODGE) !== 0 && (p.prev & Input.DODGE) === 0;
+  buf = attackPressed ? ATTACK_BUFFER : Math.max(0, buf - 1);
 
   if (act === ACT_FREE || act === ACT_BLOCK) {
     // Priority: dodge, then attack, then block, then normal movement
-    if (grounded && input & Input.DODGE) {
+    if (grounded && dodgePressed) {
       act = ACT_DODGE;
       t = 0;
-    } else if (grounded && input & Input.ATTACK) {
+    } else if (grounded && buf > 0) {
       act = ACT_ATTACK;
       t = 0;
       hit = 0;
+      buf = 0;
     } else if (grounded && input & Input.DOWN) {
       act = ACT_BLOCK;
       t = 0;
@@ -163,7 +176,7 @@ function moveFighter(
       hit = 0;
     }
   } else if (act === ACT_DODGE) {
-    if (t < DODGE_MOVE) x -= facing * DODGE_SPEED; // backward = away from where we face
+    if (t < DODGE_MOVE) x -= facing * DODGE_SPEED;
     t++;
     if (t >= DODGE_TOTAL) {
       act = ACT_FREE;
@@ -195,7 +208,7 @@ function moveFighter(
     else if (other.x < x) facing = -1;
   }
 
-  return { x, y, vy, vx, facing, hp: p.hp, act, t, hit };
+  return { x, y, vy, vx, facing, hp: p.hp, act, t, hit, prev: input, buf };
 }
 
 function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
@@ -319,6 +332,8 @@ export function checksum(s: GameState): number {
     mix(p.act);
     mix(p.t);
     mix(p.hit);
+    mix(p.prev);
+    mix(p.buf);
     mix(s.over);
     mix(s.winner);
     mix(s.wins[0]);
