@@ -19,7 +19,7 @@ const JUMP_SQUAT = 3; // ticks of crouch before leaving the ground (an attack ca
 
 // ---------- round ----------
 export const MAX_HP = 1000;
-export const ROUND_TICKS = 3600; // 60 seconds
+export const ROUND_TICKS = 99 * TICK_RATE; // 99 seconds
 export const RESTART_TICKS = 180;
 
 // ---------- combat tuning ----------
@@ -47,7 +47,8 @@ export type Move = {
   lunge: number;    // pixels moved forward per tick during startup
 };
 
-// Order matters: index = (kick ? 5 : 0) + direction, with direction 0 neutral, 1 forward, 2 back, 3 up, 4 down
+// Ground moves: index = (kick ? 5 : 0) + direction, with direction 0 neutral, 1 forward, 2 back, 3 up, 4 down.
+// Indexes 10 and 11 are the air moves.
 export const MOVES: Move[] = [
   { name: 'punch',        startup: 6,  active: 3, recovery: 10, damage: 50,  stun: 14, knockback: 5,  reach: 50, top: 100, height: 30, lunge: 0 },
   { name: 'strong punch', startup: 11, active: 4, recovery: 15, damage: 90,  stun: 18, knockback: 8,  reach: 58, top: 95,  height: 35, lunge: 3 },
@@ -59,7 +60,12 @@ export const MOVES: Move[] = [
   { name: 'back kick',    startup: 14, active: 4, recovery: 20, damage: 115, stun: 22, knockback: 12, reach: 78, top: 85,  height: 36, lunge: 0 },
   { name: 'high kick',    startup: 12, active: 4, recovery: 20, damage: 105, stun: 22, knockback: 10, reach: 62, top: 120, height: 40, lunge: 0 },
   { name: 'sweep',        startup: 11, active: 4, recovery: 20, damage: 80,  stun: 24, knockback: 8,  reach: 66, top: 25,  height: 25, lunge: 0 },
+  // Air moves (used while off the ground). The kick box reaches below the feet so a jump-in can hit.
+  { name: 'air punch',    startup: 5,  active: 6, recovery: 8,  damage: 60,  stun: 16, knockback: 6,  reach: 48, top: 105, height: 35, lunge: 0 },
+  { name: 'air kick',     startup: 6,  active: 7, recovery: 9,  damage: 80,  stun: 18, knockback: 8,  reach: 58, top: 50,  height: 55, lunge: 0 },
 ];
+export const AIR_PUNCH = 10;
+export const AIR_KICK = 11;
 
 // ---------- actions ----------
 export const ACT_FREE = 0;
@@ -210,6 +216,13 @@ function moveFighter(p: PlayerState, other: PlayerState, input: number): PlayerS
       t = 0;
     } else if (grounded && (input & Input.DOWN)) {
       // crouching: no walking, shorter hurtbox
+    } else if (!grounded && buf > 0) {
+      // a click in the air: air punch or air kick
+      act = ACT_ATTACK;
+      t = 0;
+      hit = 0;
+      mv = bufMove >= 5 ? AIR_KICK : AIR_PUNCH;
+      buf = 0;
     } else {
       if (input & Input.LEFT) x -= WALK_SPEED;
       if (input & Input.RIGHT) x += WALK_SPEED;
@@ -231,6 +244,11 @@ function moveFighter(p: PlayerState, other: PlayerState, input: number): PlayerS
   } else if (act === ACT_ATTACK) {
     const m = MOVES[mv];
     if (t < m.startup) x += facing * m.lunge;
+    if (mv >= AIR_PUNCH && !grounded) {
+      // air attacks keep the air control you had
+      if (input & Input.LEFT) x -= WALK_SPEED;
+      if (input & Input.RIGHT) x += WALK_SPEED;
+    }
     t++;
     if (t >= m.startup + m.active + m.recovery) {
       act = ACT_FREE;
@@ -276,7 +294,9 @@ function moveFighter(p: PlayerState, other: PlayerState, input: number): PlayerS
   };
 }
 
-// Push overlapping fighters apart sideways. A wall's share of the push goes to the other fighter.
+// Push overlapping fighters apart sideways, at most MAX_PUSH px per tick each, so a roll that ends
+// inside the opponent slides out instead of snapping. A wall's share of the push goes to the other fighter.
+const MAX_PUSH = 6;
 function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
   const dx = b.x - a.x;
   const overlapX = FIGHTER_W - Math.abs(dx);
@@ -284,8 +304,9 @@ function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
   if (overlapX <= 0 || overlapY <= 0) return [a, b];
 
   const dir = dx >= 0 ? 1 : -1;
-  const pushA = overlapX >> 1;
-  const pushB = overlapX - pushA;
+  const half = overlapX >> 1;
+  const pushA = Math.min(half, MAX_PUSH);
+  const pushB = Math.min(overlapX - half, MAX_PUSH);
 
   const ax = a.x - dir * pushA;
   const bx = b.x + dir * pushB;
@@ -350,7 +371,11 @@ export function step(state: GameState, inputs: Inputs): GameState {
   // After the round ends nobody can act, but fighters finish falling and being pushed back
   const live: Inputs = roundOver ? [0, 0] : inputs;
   const [a0, b0] = state.players;
-  const [a, b] = separate(moveFighter(a0, b0, live[0]), moveFighter(b0, a0, live[1]));
+  const m0 = moveFighter(a0, b0, live[0]);
+  const m1 = moveFighter(b0, a0, live[1]);
+  // A rolling fighter passes through the opponent, so nobody is pushed while a roll is running
+  const rolling = m0.act === ACT_ROLL || m1.act === ACT_ROLL;
+  const [a, b] = rolling ? [m0, m1] : separate(m0, m1);
 
   let na = a;
   let nb = b;
