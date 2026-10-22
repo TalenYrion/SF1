@@ -1,29 +1,48 @@
 import Phaser from 'phaser';
 import {
-  WIDTH, HEIGHT, TICK_RATE, Input,
-  FIGHTER_W, FIGHTER_H, GROUND_Y, MAX_HP, ROLL_INVULN, MOVES,
-  ACT_ATTACK, ACT_HITSTUN, ACT_BLOCKSTUN, ACT_ROLL, ACT_JUMPSQUAT,
-  createInitialState, step, attackBox, hurtbox,
+  WIDTH,
+  HEIGHT,
+  TICK_RATE,
+  Input,
+  GROUND_Y,
+  MAX_HP,
+  MOVES,
+  ACT_ATTACK,
+  createInitialState,
+  step,
+  attackBox,
+  hurtbox,
   type GameState,
 } from './sim';
+import {
+  Animator,
+  ANIMS,
+  targetPose,
+  solve,
+  shapesOf,
+  type Shape,
+} from './rig';
 import { Rollback } from './rollback';
 import { joinRoom, socket, startPeer, closePeer, sendToPeer } from './net';
 
-type Keys = Record<'W' | 'A' | 'S' | 'D' | 'Q' | 'E' | 'Z' | 'C', Phaser.Input.Keyboard.Key>;
+type Keys = Record<
+  'W' | 'A' | 'S' | 'D' | 'Q' | 'E' | 'Z' | 'C',
+  Phaser.Input.Keyboard.Key
+>;
 
 const TICK_MS = 1000 / TICK_RATE;
 const LIVENESS_TIMEOUT = 5000;
-const BASE_COLORS = [0xff0000, 0x00aaff];
+const TEAM_COLORS = [0xe03030, 0x3070e0]; // the ring under each fighter
 
 const params = new URLSearchParams(location.search);
 const room = params.get('room');
 const LAG = Number(params.get('lag') ?? 0);
 const JITTER = Number(params.get('jitter') ?? 0);
 const LOSS = Number(params.get('loss') ?? 0);
-const SKEW = Number(params.get('skew') ?? 1);   // test only: above 1 makes THIS window's clock run fast
-const SYNC = params.get('nosync') === null;     // ?nosync=1 turns the drift correction off
-const DEBUG = params.get('debug') !== null;     // ?debug=1 draws the hurtboxes
-const DUMMY = params.get('dummy') ?? 'idle';    // offline only: idle, punch or kick
+const SKEW = Number(params.get('skew') ?? 1); // test only: above 1 makes THIS window's clock run fast
+const SYNC = params.get('nosync') === null; // ?nosync=1 turns the drift correction off
+const DEBUG = params.get('debug') !== null; // ?debug=1 shows hurtboxes, hitboxes and move names
+const DUMMY = params.get('dummy') ?? 'idle'; // offline only: idle, punch or kick
 
 function send(msg: string): void {
   if (Math.random() < LOSS) return;
@@ -87,70 +106,136 @@ setInterval(() => {
   if (session) send('P' + performance.now());
 }, 1000);
 
+// ---------- drawing helpers ----------
+
+const SHADE_COLORS = [0x0a0a0a, 0x2c2c34]; // front limbs, rear limbs
+
+function drawShape(g: Phaser.GameObjects.Graphics, s: Shape): void {
+  g.fillStyle(SHADE_COLORS[s.shade], 1);
+  if (s.k === 'circle') {
+    g.fillCircle(s.x, s.y, s.r);
+    return;
+  }
+  // A limb is a quad that tapers from one end to the other, with a round cap on each end
+  const dx = s.bx - s.ax;
+  const dy = s.by - s.ay;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  const ra = s.wa / 2;
+  const rb = s.wb / 2;
+  const x1 = s.ax + nx * ra,
+    y1 = s.ay + ny * ra;
+  const x2 = s.bx + nx * rb,
+    y2 = s.by + ny * rb;
+  const x3 = s.bx - nx * rb,
+    y3 = s.by - ny * rb;
+  const x4 = s.ax - nx * ra,
+    y4 = s.ay - ny * ra;
+  g.fillTriangle(x1, y1, x2, y2, x3, y3);
+  g.fillTriangle(x1, y1, x3, y3, x4, y4);
+  g.fillCircle(s.ax, s.ay, ra);
+  g.fillCircle(s.bx, s.by, rb);
+}
+
+type Spark = { x: number; y: number; age: number; size: number };
+
+const TEXT = { color: '#ffffff', stroke: '#000000', strokeThickness: 3 };
+
 class MainScene extends Phaser.Scene {
   private state: GameState = createInitialState();
   private accumulator = 0;
-  private bodies: Phaser.GameObjects.Rectangle[] = [];
-  private faces: Phaser.GameObjects.Rectangle[] = [];
-  private atkBoxes: Phaser.GameObjects.Rectangle[] = [];
+  private animators = [new Animator(), new Animator()];
+  private sparks: Spark[] = [];
+  private lastHp = [MAX_HP, MAX_HP];
+  private prevFrame = 0;
+  private prevOver = 0;
+  private body!: Phaser.GameObjects.Graphics;
+  private fx!: Phaser.GameObjects.Graphics;
+  private dbg!: Phaser.GameObjects.Graphics;
   private labels: Phaser.GameObjects.Text[] = [];
   private hpBars: Phaser.GameObjects.Rectangle[] = [];
   private hud!: Phaser.GameObjects.Text;
   private score!: Phaser.GameObjects.Text;
   private clock!: Phaser.GameObjects.Text;
   private banner!: Phaser.GameObjects.Text;
-  private dbg!: Phaser.GameObjects.Graphics;
   private keys!: Keys;
-  private highlighted = -1;
 
   create(): void {
     this.keys = this.input.keyboard!.addKeys('W,A,S,D,Q,E,Z,C') as Keys;
 
-    this.add.rectangle(WIDTH / 2, GROUND_Y, WIDTH, 4, 0x888888).setOrigin(0.5, 0);
+    // Background: a dusk sky in bands, a distant ridge, and the ground
+    const sky = this.add.graphics();
+    const top = [0x56688a, 0x8a7a98, 0xd9967a, 0xf0c090]; // top of the sky down to the horizon
+    const bands = 24;
+    for (let i = 0; i < bands; i++) {
+      const t = (i / (bands - 1)) * (top.length - 1);
+      const a = Math.floor(t);
+      const b = Math.min(a + 1, top.length - 1);
+      const f = t - a;
+      const r = ((top[a] >> 16) & 255) * (1 - f) + ((top[b] >> 16) & 255) * f;
+      const g = ((top[a] >> 8) & 255) * (1 - f) + ((top[b] >> 8) & 255) * f;
+      const bl = (top[a] & 255) * (1 - f) + (top[b] & 255) * f;
+      sky.fillStyle(
+        (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(bl),
+        1,
+      );
+      sky.fillRect(0, (GROUND_Y / bands) * i, WIDTH, GROUND_Y / bands + 1);
+    }
+    sky.fillStyle(0x3a3a52, 1);
+    sky.fillTriangle(-40, GROUND_Y, 160, GROUND_Y - 120, 360, GROUND_Y);
+    sky.fillTriangle(260, GROUND_Y, 470, GROUND_Y - 80, 700, GROUND_Y);
+    sky.fillTriangle(560, GROUND_Y, 760, GROUND_Y - 140, 900, GROUND_Y);
+    sky.fillStyle(0x23252f, 1);
+    sky.fillRect(0, GROUND_Y, WIDTH, HEIGHT - GROUND_Y);
+    sky.fillStyle(0x3b3e4c, 1);
+    sky.fillRect(0, GROUND_Y, WIDTH, 3);
+
+    this.body = this.add.graphics();
+    this.fx = this.add.graphics();
+    this.dbg = this.add.graphics();
+    this.labels = [
+      this.add.text(0, 0, '', { fontSize: '12px', ...TEXT }).setOrigin(0.5, 1),
+      this.add.text(0, 0, '', { fontSize: '12px', ...TEXT }).setOrigin(0.5, 1),
+    ];
 
     // Health bars: dark background, then the coloured bar on top
-    this.add.rectangle(20, 36, 300, 16, 0x444444).setOrigin(0, 0);
-    this.add.rectangle(WIDTH - 20, 36, 300, 16, 0x444444).setOrigin(1, 0);
+    this.add
+      .rectangle(20, 36, 300, 16, 0x222222)
+      .setOrigin(0, 0)
+      .setStrokeStyle(2, 0x000000);
+    this.add
+      .rectangle(WIDTH - 20, 36, 300, 16, 0x222222)
+      .setOrigin(1, 0)
+      .setStrokeStyle(2, 0x000000);
     this.hpBars = [
-      this.add.rectangle(20, 36, 300, 16, 0x22cc55).setOrigin(0, 0),
-      this.add.rectangle(WIDTH - 20, 36, 300, 16, 0x22cc55).setOrigin(1, 0),
+      this.add.rectangle(20, 36, 300, 16, 0xe8c030).setOrigin(0, 0),
+      this.add.rectangle(WIDTH - 20, 36, 300, 16, 0xe8c030).setOrigin(1, 0),
     ];
 
-    this.bodies = [
-      this.add.rectangle(0, 0, FIGHTER_W, FIGHTER_H, BASE_COLORS[0]).setOrigin(0.5, 1),
-      this.add.rectangle(0, 0, FIGHTER_W, FIGHTER_H, BASE_COLORS[1]).setOrigin(0.5, 1),
-    ];
-    this.faces = [
-      this.add.rectangle(0, 0, 14, 14, 0xffffff),
-      this.add.rectangle(0, 0, 14, 14, 0xffffff),
-    ];
-    // 1x1 rectangles that get scaled to the hitbox size each frame
-    this.atkBoxes = [
-      this.add.rectangle(0, 0, 1, 1, 0xffff00, 0.5).setVisible(false),
-      this.add.rectangle(0, 0, 1, 1, 0xffff00, 0.5).setVisible(false),
-    ];
-    this.labels = [
-      this.add.text(0, 0, '', { fontSize: '12px', color: '#ffffff' }).setOrigin(0.5, 1),
-      this.add.text(0, 0, '', { fontSize: '12px', color: '#ffffff' }).setOrigin(0.5, 1),
-    ];
-    this.dbg = this.add.graphics();
-
-    this.hud = this.add.text(10, 10, '', { fontSize: '14px', color: '#ffffff' });
+    this.hud = this.add.text(10, 10, '', { fontSize: '14px', ...TEXT });
     this.score = this.add
-      .text(WIDTH / 2, 26, '0  -  0', { fontSize: '26px', color: '#ffffff' })
+      .text(WIDTH / 2, 26, '0  -  0', { fontSize: '26px', ...TEXT })
       .setOrigin(0.5, 0);
     this.clock = this.add
-      .text(WIDTH / 2, 58, '', { fontSize: '18px', color: '#dddddd' })
+      .text(WIDTH / 2, 58, '', { fontSize: '18px', ...TEXT })
       .setOrigin(0.5, 0);
     this.banner = this.add
-      .text(WIDTH / 2, 220, '', { fontSize: '56px', color: '#ffdd44', fontStyle: 'bold' })
+      .text(WIDTH / 2, 200, '', {
+        fontSize: '56px',
+        fontStyle: 'bold',
+        ...TEXT,
+        color: '#ffdd44',
+        strokeThickness: 6,
+      })
       .setOrigin(0.5);
 
-    this.render(this.state);
+    this.render(this.state, 0);
   }
 
   update(_time: number, delta: number): void {
     this.accumulator += Math.min(delta, 250);
+    const dt = Math.min(delta, 100) / 1000;
 
     if (session && performance.now() - lastHeard > LIVENESS_TIMEOUT) {
       endSession('Connection lost');
@@ -166,16 +251,19 @@ class MainScene extends Phaser.Scene {
         }
         this.accumulator -= tickMs;
       }
-      this.render(session.state);
+      this.render(session.state, dt);
     } else if (!room) {
       while (this.accumulator >= TICK_MS) {
-        this.state = step(this.state, [this.readInput(), dummyInput(this.state.frame)]);
+        this.state = step(this.state, [
+          this.readInput(),
+          dummyInput(this.state.frame),
+        ]);
         this.accumulator -= TICK_MS;
       }
-      this.render(this.state);
+      this.render(this.state, dt);
     } else {
       this.accumulator = 0;
-      this.render(this.state);
+      this.render(this.state, dt);
     }
   }
 
@@ -196,54 +284,111 @@ class MainScene extends Phaser.Scene {
     return input;
   }
 
-  private render(state: GameState): void {
+  private render(state: GameState, dt: number): void {
+    // A new round or a new match: forget the old poses so nothing slides in from the last one
+    if (
+      (this.prevOver > 0 && state.over === 0) ||
+      state.frame < this.prevFrame - 30
+    ) {
+      this.animators.forEach((a) => a.reset());
+      this.lastHp = state.players.map((p) => p.hp);
+      this.sparks = [];
+    }
+    this.prevFrame = state.frame;
+    this.prevOver = state.over;
+
+    this.body.clear();
+    this.fx.clear();
     this.dbg.clear();
 
+    const mine = session ? session.localIndex : room ? -1 : 0;
+
     state.players.forEach((p, i) => {
-      // Placeholder colours show the phase. The black silhouettes come with the animation step.
-      let color = BASE_COLORS[i];
-      let alpha = 1;
-      if (p.act === ACT_HITSTUN) color = 0xffffff;
-      else if (p.act === ACT_BLOCKSTUN) color = 0x99ffdd;
-      else if (p.act === ACT_ROLL) alpha = p.t < ROLL_INVULN ? 0.3 : 0.7;
-      else if (p.act === ACT_JUMPSQUAT) alpha = 0.8;
-      else if (p.act === ACT_ATTACK) {
-        const m = MOVES[p.mv];
-        if (p.t < m.startup) color = 0xffaa00;
-        else if (p.t < m.startup + m.active) color = 0xffff00;
-        else color = 0x888888;
+      const anim = this.animators[i];
+      anim.place(p.x, p.y);
+      const target = targetPose(p, {
+        frame: state.frame,
+        index: i,
+        over: state.over,
+        won: state.winner === i,
+      });
+      const pose = anim.update(target, dt);
+      const skeleton = solve(pose);
+      const strike = p.act === ACT_ATTACK ? ANIMS[p.mv].strike : undefined;
+
+      // Shadow on the ground, in the fighter's colour, smaller when they are in the air
+      const lift = Math.max(0, GROUND_Y - anim.y);
+      const size = Math.max(0.4, 1 - lift / 300);
+      this.body.fillStyle(TEAM_COLORS[i], 0.55);
+      this.body.fillEllipse(anim.x, GROUND_Y + 3, 78 * size, 13 * size);
+
+      for (const shape of shapesOf(skeleton, p.facing, anim.x, anim.y, strike))
+        drawShape(this.body, shape);
+
+      // A small white marker over the head of the fighter you control
+      if (i === mine) {
+        const hx = anim.x + p.facing * skeleton.head.x;
+        const hy = anim.y - skeleton.head.y - 22;
+        this.body.fillStyle(0xffffff, 1);
+        this.body.fillTriangle(hx - 6, hy - 9, hx + 6, hy - 9, hx, hy);
       }
 
-      // The body is as tall as the hurtbox, so crouching shrinks it
-      const hb = hurtbox(p);
-      const h = p.y - hb.top;
-      this.bodies[i]
-        .setPosition(p.x, p.y)
-        .setScale(1, h / FIGHTER_H)
-        .setFillStyle(color)
-        .setAlpha(alpha);
-      this.faces[i].setPosition(p.x + p.facing * 16, p.y - h + 24);
-      this.labels[i]
-        .setPosition(p.x, p.y - h - 4)
-        .setText(p.act === ACT_ATTACK ? MOVES[p.mv].name : '');
-
-      const box = attackBox(p);
-      if (box) {
-        this.atkBoxes[i]
-          .setPosition((box.left + box.right) / 2, (box.top + box.bottom) / 2)
-          .setScale(box.right - box.left, box.bottom - box.top)
-          .setVisible(true);
-      } else {
-        this.atkBoxes[i].setVisible(false);
+      // Hit spark when health drops
+      if (p.hp < this.lastHp[i]) {
+        this.sparks.push({
+          x: p.x,
+          y: p.y - 72,
+          age: 0,
+          size: 14 + Math.min(30, (this.lastHp[i] - p.hp) / 3),
+        });
       }
-
-      if (DEBUG) {
-        this.dbg.lineStyle(1, 0x00ff66, 1);
-        this.dbg.strokeRect(hb.left, hb.top, hb.right - hb.left, hb.bottom - hb.top);
-      }
+      this.lastHp[i] = p.hp;
 
       this.hpBars[i].setScale(p.hp / MAX_HP, 1);
+
+      if (DEBUG) {
+        const hb = hurtbox(p);
+        this.dbg.lineStyle(1, 0x00ff66, 1);
+        this.dbg.strokeRect(
+          hb.left,
+          hb.top,
+          hb.right - hb.left,
+          hb.bottom - hb.top,
+        );
+        const box = attackBox(p);
+        if (box) {
+          this.dbg.fillStyle(0xffff00, 0.45);
+          this.dbg.fillRect(
+            box.left,
+            box.top,
+            box.right - box.left,
+            box.bottom - box.top,
+          );
+        }
+        this.labels[i]
+          .setPosition(p.x, hb.top - 6)
+          .setText(p.act === ACT_ATTACK ? MOVES[p.mv].name : '');
+      }
     });
+
+    // Sparks: a short white starburst
+    this.sparks = this.sparks.filter((s) => s.age < 0.2);
+    for (const s of this.sparks) {
+      s.age += dt;
+      const t = Math.min(1, s.age / 0.2);
+      this.fx.lineStyle(3, 0xffffff, 1 - t);
+      for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2 + 0.4;
+        const r0 = s.size * 0.3 * (1 + t);
+        const r1 = s.size * (0.6 + t);
+        this.fx.lineBetween(
+          s.x + Math.cos(a) * r0,
+          s.y + Math.sin(a) * r0,
+          s.x + Math.cos(a) * r1,
+          s.y + Math.sin(a) * r1,
+        );
+      }
+    }
 
     this.score.setText(`${state.wins[0]}  -  ${state.wins[1]}`);
     this.clock.setText(String(Math.ceil(state.time / TICK_RATE)));
@@ -255,12 +400,6 @@ class MainScene extends Phaser.Scene {
           : `${ko ? 'KO' : 'TIME'}! ${state.winner === 0 ? 'RED' : 'BLUE'} WINS`
         : '',
     );
-
-    const mine = session ? session.localIndex : -1;
-    if (mine !== this.highlighted) {
-      this.bodies.forEach((c, i) => c.setStrokeStyle(i === mine ? 4 : 0, 0xffffff));
-      this.highlighted = mine;
-    }
 
     if (session) {
       const desync = session.desyncFrame;
