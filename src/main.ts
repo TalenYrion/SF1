@@ -34,6 +34,14 @@ const TICK_MS = 1000 / TICK_RATE;
 const LIVENESS_TIMEOUT = 5000;
 const TEAM_COLORS = [0xe03030, 0x3070e0]; // the ring under each fighter
 
+// The game world is small (480 x 270 units, a fighter is 120 units tall) and is drawn ZOOM times bigger.
+// Everything in the simulation stays in world units; only drawing multiplies by ZOOM.
+const ZOOM = 2;
+const SW = WIDTH * ZOOM; // screen width in pixels
+const SH = HEIGHT * ZOOM;
+const GY = GROUND_Y * ZOOM; // ground line on screen
+const BAR_W = SW / 2 - 80;
+
 const params = new URLSearchParams(location.search);
 const room = params.get('room');
 const LAG = Number(params.get('lag') ?? 0);
@@ -180,16 +188,16 @@ class MainScene extends Phaser.Scene {
         (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(bl),
         1,
       );
-      sky.fillRect(0, (GROUND_Y / bands) * i, WIDTH, GROUND_Y / bands + 1);
+      sky.fillRect(0, (GY / bands) * i, SW, GY / bands + 1);
     }
     sky.fillStyle(0x3a3a52, 1);
-    sky.fillTriangle(-40, GROUND_Y, 160, GROUND_Y - 120, 360, GROUND_Y);
-    sky.fillTriangle(260, GROUND_Y, 470, GROUND_Y - 80, 700, GROUND_Y);
-    sky.fillTriangle(560, GROUND_Y, 760, GROUND_Y - 140, 900, GROUND_Y);
+    sky.fillTriangle(-40, GY, 190, GY - 150, 420, GY);
+    sky.fillTriangle(300, GY, 560, GY - 100, 820, GY);
+    sky.fillTriangle(640, GY, 880, GY - 170, 1040, GY);
     sky.fillStyle(0x23252f, 1);
-    sky.fillRect(0, GROUND_Y, WIDTH, HEIGHT - GROUND_Y);
+    sky.fillRect(0, GY, SW, SH - GY);
     sky.fillStyle(0x3b3e4c, 1);
-    sky.fillRect(0, GROUND_Y, WIDTH, 3);
+    sky.fillRect(0, GY, SW, 4);
 
     this.body = this.add.graphics();
     this.fx = this.add.graphics();
@@ -201,27 +209,27 @@ class MainScene extends Phaser.Scene {
 
     // Health bars: dark background, then the coloured bar on top
     this.add
-      .rectangle(20, 36, 300, 16, 0x222222)
+      .rectangle(20, 36, BAR_W, 16, 0x222222)
       .setOrigin(0, 0)
       .setStrokeStyle(2, 0x000000);
     this.add
-      .rectangle(WIDTH - 20, 36, 300, 16, 0x222222)
+      .rectangle(SW - 20, 36, BAR_W, 16, 0x222222)
       .setOrigin(1, 0)
       .setStrokeStyle(2, 0x000000);
     this.hpBars = [
-      this.add.rectangle(20, 36, 300, 16, 0xe8c030).setOrigin(0, 0),
-      this.add.rectangle(WIDTH - 20, 36, 300, 16, 0xe8c030).setOrigin(1, 0),
+      this.add.rectangle(20, 36, BAR_W, 16, 0xe8c030).setOrigin(0, 0),
+      this.add.rectangle(SW - 20, 36, BAR_W, 16, 0xe8c030).setOrigin(1, 0),
     ];
 
     this.hud = this.add.text(10, 10, '', { fontSize: '14px', ...TEXT });
     this.score = this.add
-      .text(WIDTH / 2, 26, '0  -  0', { fontSize: '26px', ...TEXT })
+      .text(SW / 2, 26, '0  -  0', { fontSize: '26px', ...TEXT })
       .setOrigin(0.5, 0);
     this.clock = this.add
-      .text(WIDTH / 2, 58, '', { fontSize: '18px', ...TEXT })
+      .text(SW / 2, 58, '', { fontSize: '18px', ...TEXT })
       .setOrigin(0.5, 0);
     this.banner = this.add
-      .text(WIDTH / 2, 200, '', {
+      .text(SW / 2, 190, '', {
         fontSize: '56px',
         fontStyle: 'bold',
         ...TEXT,
@@ -318,28 +326,42 @@ class MainScene extends Phaser.Scene {
 
       // Shadow on the ground, in the fighter's colour, smaller when they are in the air
       const lift = Math.max(0, GROUND_Y - anim.y);
-      const size = Math.max(0.4, 1 - lift / 300);
+      const size = Math.max(0.5, 1 - lift / 150);
       this.body.fillStyle(TEAM_COLORS[i], 0.55);
-      this.body.fillEllipse(anim.x, GROUND_Y + 3, 78 * size, 13 * size);
+      this.body.fillEllipse(
+        anim.x * ZOOM,
+        (GROUND_Y + 2) * ZOOM,
+        70 * size * ZOOM,
+        11 * size * ZOOM,
+      );
 
-      for (const shape of shapesOf(skeleton, p.facing, anim.x, anim.y, strike))
+      for (const shape of shapesOf(
+        skeleton,
+        p.facing,
+        anim.x,
+        anim.y,
+        strike,
+        ZOOM,
+      ))
         drawShape(this.body, shape);
 
       // A small white marker over the head of the fighter you control
       if (i === mine) {
-        const hx = anim.x + p.facing * skeleton.head.x;
-        const hy = anim.y - skeleton.head.y - 22;
+        const hx = (anim.x + p.facing * skeleton.head.x) * ZOOM;
+        const hy = (anim.y - skeleton.head.y) * ZOOM - 30;
         this.body.fillStyle(0xffffff, 1);
-        this.body.fillTriangle(hx - 6, hy - 9, hx + 6, hy - 9, hx, hy);
+        this.body.fillTriangle(hx - 7, hy - 12, hx + 7, hy - 12, hx, hy);
       }
 
       // Hit spark when health drops
       if (p.hp < this.lastHp[i]) {
+        const sparkSize =
+          (10 + Math.min(22, (this.lastHp[i] - p.hp) / 4)) * ZOOM;
         this.sparks.push({
-          x: p.x,
-          y: p.y - 72,
+          x: p.x * ZOOM,
+          y: (p.y - 72) * ZOOM,
           age: 0,
-          size: 14 + Math.min(30, (this.lastHp[i] - p.hp) / 3),
+          size: sparkSize,
         });
       }
       this.lastHp[i] = p.hp;
@@ -350,23 +372,23 @@ class MainScene extends Phaser.Scene {
         const hb = hurtbox(p);
         this.dbg.lineStyle(1, 0x00ff66, 1);
         this.dbg.strokeRect(
-          hb.left,
-          hb.top,
-          hb.right - hb.left,
-          hb.bottom - hb.top,
+          hb.left * ZOOM,
+          hb.top * ZOOM,
+          (hb.right - hb.left) * ZOOM,
+          (hb.bottom - hb.top) * ZOOM,
         );
         const box = attackBox(p);
         if (box) {
           this.dbg.fillStyle(0xffff00, 0.45);
           this.dbg.fillRect(
-            box.left,
-            box.top,
-            box.right - box.left,
-            box.bottom - box.top,
+            box.left * ZOOM,
+            box.top * ZOOM,
+            (box.right - box.left) * ZOOM,
+            (box.bottom - box.top) * ZOOM,
           );
         }
         this.labels[i]
-          .setPosition(p.x, hb.top - 6)
+          .setPosition(p.x * ZOOM, hb.top * ZOOM - 6)
           .setText(p.act === ACT_ATTACK ? MOVES[p.mv].name : '');
       }
     });
@@ -417,8 +439,8 @@ class MainScene extends Phaser.Scene {
 
 new Phaser.Game({
   type: Phaser.AUTO,
-  width: WIDTH,
-  height: HEIGHT,
+  width: SW,
+  height: SH,
   backgroundColor: '#222222',
   scene: MainScene,
 });

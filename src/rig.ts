@@ -11,6 +11,8 @@ import {
   ACT_JUMPSQUAT,
   ROLL_MOVE,
   GROUND_Y,
+  JUMP_V,
+  JUMP_SQUAT,
   Input,
   isCrouching,
   type PlayerState,
@@ -44,6 +46,7 @@ export type Pose = {
   rot: number; // whole body rotation, degrees counter-clockwise
   px: number;
   py: number; // the point the body rotates around
+  turn: number; // 0 = facing the opponent, 1 = turned right round (everything mirrored). In between the body is edge-on.
 };
 const KEYS: (keyof Pose)[] = [
   'hx',
@@ -61,6 +64,7 @@ const KEYS: (keyof Pose)[] = [
   'rot',
   'px',
   'py',
+  'turn',
 ];
 
 export function lerpPose(a: Pose, b: Pose, k: number): Pose {
@@ -85,6 +89,7 @@ export const STANCE: Pose = {
   rot: 0,
   px: 0,
   py: 50,
+  turn: 0,
 };
 const P = (o: Partial<Pose>): Pose => ({ ...STANCE, ...o });
 
@@ -372,33 +377,39 @@ export const ANIMS: Anim[] = [
       rhy: 94,
     }),
   },
-  // 7 back kick: roundhouse with the rear leg
+  // 7 back kick: the fighter turns their back on the opponent and thrusts the rear leg out behind them.
+  // Poses here are written in the turned frame: "forward" is away from the opponent, and the kick goes to negative x.
   {
     strike: 'rf',
     wind: P({
+      turn: 1,
       hx: -14,
-      hy: 58,
-      lean: 16,
-      tilt: 6,
-      rfx: -30,
-      rfy: 60,
-      lfx: 8,
-      lhx: 28,
-      lhy: 96,
-      rhx: 16,
-      rhy: 98,
+      hy: 62,
+      lean: 14,
+      tilt: -12,
+      lfx: -14,
+      lfy: 0,
+      rfx: -34,
+      rfy: 42,
+      lhx: 14,
+      lhy: 86,
+      rhx: -2,
+      rhy: 90,
     }),
     hit: P({
-      hx: 44,
-      hy: 60,
-      lean: -18,
-      rfx: 98,
-      rfy: 66,
-      lfx: 40,
-      lhx: 10,
-      lhy: 96,
-      rhx: -8,
-      rhy: 92,
+      turn: 1,
+      hx: -26,
+      hy: 66,
+      lean: 72,
+      tilt: -30,
+      lfx: -24,
+      lfy: 0,
+      rfx: -94,
+      rfy: 68,
+      lhx: 22,
+      lhy: 58,
+      rhx: -6,
+      rhy: 64,
     }),
   },
   // 8 high kick
@@ -607,7 +618,15 @@ export function targetPose(p: PlayerState, ctx: Ctx): Target {
     case ACT_BLOCKSTUN:
       return { pose: BLOCK, rate: 35 };
     case ACT_JUMPSQUAT:
-      return { pose: JUMPSQUAT, rate: 30 };
+      // sink into the crouch over the wind-up, then spring
+      return {
+        pose: lerpPose(
+          STANCE,
+          JUMPSQUAT,
+          smooth(clamp((p.t + 1) / (JUMP_SQUAT * 0.7), 0, 1)),
+        ),
+        rate: 30,
+      };
     case ACT_ROLL: {
       // Tuck and somersault in the direction of travel, then stand up
       const forward = p.vx * p.facing > 0;
@@ -620,7 +639,8 @@ export function targetPose(p: PlayerState, ctx: Ctx): Target {
     }
     default: {
       if (!grounded) {
-        const k = smooth(clamp((p.vy + 20) / 40, 0, 1));
+        const jv = Math.abs(JUMP_V);
+        const k = smooth(clamp((p.vy + jv) / (2 * jv), 0, 1)); // rising -> falling
         return { pose: lerpPose(AIR_RISE, AIR_FALL, k), rate: 22 };
       }
       if (isCrouching(p)) return { pose: CROUCH, rate: 26 };
@@ -726,20 +746,27 @@ export function solve(pose: Pose): Skeleton {
     return { x: foot.x + TOE * tx, y: foot.y + TOE * ty - (1 - w) * 2 };
   };
 
+  // Turning round: squash everything sideways about the centre line, through edge-on, to a mirror image
+  const sx = Math.cos(Math.PI * pose.turn);
+  const T = (v: V): V => {
+    const r = rotate(v);
+    return { x: r.x * sx, y: r.y };
+  };
+
   return {
-    hip: rotate(hip),
-    shoulder: rotate(shoulder),
-    head: rotate(head),
-    leadElbow: rotate(la.mid),
-    leadHand: rotate(la.end),
-    rearElbow: rotate(ra.mid),
-    rearHand: rotate(ra.end),
-    leadKnee: rotate(ll.mid),
-    leadFoot: rotate(ll.end),
-    leadToe: rotate(toeOf(ll.mid, ll.end)),
-    rearKnee: rotate(rl.mid),
-    rearFoot: rotate(rl.end),
-    rearToe: rotate(toeOf(rl.mid, rl.end)),
+    hip: T(hip),
+    shoulder: T(shoulder),
+    head: T(head),
+    leadElbow: T(la.mid),
+    leadHand: T(la.end),
+    rearElbow: T(ra.mid),
+    rearHand: T(ra.end),
+    leadKnee: T(ll.mid),
+    leadFoot: T(ll.end),
+    leadToe: T(toeOf(ll.mid, ll.end)),
+    rearKnee: T(rl.mid),
+    rearFoot: T(rl.end),
+    rearToe: T(toeOf(rl.mid, rl.end)),
   };
 }
 
@@ -771,6 +798,7 @@ export type Shape =
 /**
  * Silhouette parts in draw order, in world coordinates (y down), for a fighter at (ox, oy) facing `facing`.
  * `strike` is the limb that is attacking: it is drawn in front of the body, even if it is a rear limb.
+ * `scale` converts world units to screen pixels (everything is multiplied by it).
  */
 export function shapesOf(
   sk: Skeleton,
@@ -778,16 +806,29 @@ export function shapesOf(
   ox: number,
   oy: number,
   strike?: Limb,
+  scale = 1,
 ): Shape[] {
-  const W = (v: V): V => ({ x: ox + facing * v.x, y: oy - v.y });
+  const W = (v: V): V => ({
+    x: (ox + facing * v.x) * scale,
+    y: (oy - v.y) * scale,
+  });
   const cap = (a: V, b: V, wa: number, wb: number, shade: 0 | 1): Shape => {
     const A = W(a);
     const B = W(b);
-    return { k: 'cap', ax: A.x, ay: A.y, bx: B.x, by: B.y, wa, wb, shade };
+    return {
+      k: 'cap',
+      ax: A.x,
+      ay: A.y,
+      bx: B.x,
+      by: B.y,
+      wa: wa * scale,
+      wb: wb * scale,
+      shade,
+    };
   };
   const dot = (v: V, r: number, shade: 0 | 1): Shape => {
     const A = W(v);
-    return { k: 'circle', x: A.x, y: A.y, r, shade };
+    return { k: 'circle', x: A.x, y: A.y, r: r * scale, shade };
   };
   const rearArm = (shade: 0 | 1): Shape[] => [
     cap(sk.shoulder, sk.rearElbow, 8, 7, shade),
