@@ -9,11 +9,17 @@ import {
   ACT_BLOCKSTUN,
   ACT_ROLL,
   ACT_JUMPSQUAT,
+  ACT_STEP,
+  ACT_DASH,
+  ACT_FLIP,
   ROLL_MOVE,
   GROUND_Y,
   JUMP_V,
   JUMP_SQUAT,
-  Input,
+  STEP_TICKS,
+  DASH_TICKS,
+  FLIP_SQUAT,
+  FLIP_AIR,
   isCrouching,
   type PlayerState,
 } from './sim';
@@ -180,7 +186,37 @@ export const ROLL = P({
   px: 4,
   py: 36,
 });
-export const KO = P({
+export const DASH_POSE = P({
+  hx: 14,
+  hy: 52,
+  lean: 26,
+  tilt: -6,
+  lhx: 44,
+  lhy: 84,
+  rhx: 26,
+  rhy: 90,
+  lfx: 46,
+  lfy: 0,
+  rfx: -34,
+  rfy: 16,
+});
+const FLIP_TUCK = P({
+  hx: 6,
+  hy: 66,
+  lean: 60,
+  tilt: 20,
+  lhx: 20,
+  lhy: 62,
+  rhx: 12,
+  rhy: 58,
+  lfx: 2,
+  lfy: 50,
+  rfx: -6,
+  rfy: 44,
+  px: 4,
+  py: 68,
+});
+const KO = P({
   hx: 0,
   hy: 62,
   lean: 0,
@@ -550,36 +586,69 @@ export function attackPoseAt(mv: number, tt: number): Pose {
   return lerpPose(a.hit, base, smooth((t - E) / (T - E)));
 }
 
-// ---------- walking, driven by how far the body has travelled so feet never skate ----------
-const STEP_A = 20; // feet swing +-20px around their rest spot
-const STRIDE = STEP_A * 4; // one full walk cycle covers 80px
-const STEP_LIFT = 12;
+// ---------- stepping, dashing, flipping ----------
 
-function footCycle(u: number): { x: number; y: number } {
-  const TAU = Math.PI * 2;
-  const v = ((u % TAU) + TAU) % TAU;
-  if (v < Math.PI) {
-    const s = v / Math.PI; // swing: foot lifts and moves forward
-    return { x: -STEP_A + 2 * STEP_A * smooth(s), y: STEP_LIFT * Math.sin(v) };
+/** One quick step. u runs 0..1 over the step; the leading foot swings first and the other follows. */
+export function stepPose(p: PlayerState): Pose {
+  const u = clamp(p.t / STEP_TICKS, 0, 1);
+  const a = Math.sin(Math.PI * clamp(u / 0.8, 0, 1));
+  const b = Math.sin(Math.PI * clamp((u - 0.2) / 0.8, 0, 1));
+  if (p.vx * p.facing > 0) {
+    // toward the opponent: the lead foot reaches out, the rear foot catches up, the body leans in
+    return P({
+      hy: 59 - 2 * a,
+      lean: 8 + 7 * a,
+      lfx: 16 + 16 * a,
+      lfy: 9 * a,
+      rfx: -18 + 12 * b,
+      rfy: 7 * b,
+      lhx: 30 + 3 * a,
+      rhx: 14 + 2 * a,
+    });
   }
-  const s = (v - Math.PI) / Math.PI; // stance: foot on the ground moves back at body speed
-  return { x: STEP_A - 2 * STEP_A * s, y: 0 };
+  // away: the rear foot goes first, the lead foot follows, the body stays upright and guarded
+  return P({
+    hy: 59 - 2 * a,
+    lean: 6 - 3 * a,
+    rfx: -18 - 14 * a,
+    rfy: 8 * a,
+    lfx: 16 - 10 * b,
+    lfy: 6 * b,
+    lhx: 28,
+    lhy: 94,
+    rhx: 14,
+    rhy: 100,
+  });
 }
 
-export function walkPose(p: PlayerState): Pose {
-  const th = ((p.x * p.facing) / STRIDE) * Math.PI * 2;
-  const a = footCycle(th);
-  const b = footCycle(th + Math.PI);
-  return P({
-    hy: 59 - 2 * Math.abs(Math.cos(th)),
-    lean: 9,
-    lfx: STANCE.lfx + a.x,
-    lfy: a.y,
-    rfx: STANCE.rfx + b.x,
-    rfy: b.y,
-    lhx: 30 + 2 * Math.sin(th),
-    rhx: 14 - 2 * Math.sin(th),
-  });
+/** A low lunge forward: drop in over the first ticks, hold, then rise out of it. */
+export function dashPose(p: PlayerState): Pose {
+  const into = smooth(clamp((p.t + 1) / 3, 0, 1));
+  const out = smooth(clamp((p.t - (DASH_TICKS - 6)) / 6, 0, 1));
+  return lerpPose(STANCE, DASH_POSE, into * (1 - out));
+}
+
+/** Crouch, spring, then a tucked somersault over the whole time in the air. */
+export function flipTarget(p: PlayerState): Target {
+  if (p.t <= FLIP_SQUAT) {
+    return {
+      pose: lerpPose(STANCE, JUMPSQUAT, smooth(clamp(p.t / FLIP_SQUAT, 0, 1))),
+      rate: 35,
+    };
+  }
+  const prog = clamp((p.t - FLIP_SQUAT) / FLIP_AIR, 0, 1);
+  const forward = p.vx * p.facing > 0;
+  // tucked through the middle of the flip, opening up again for the landing
+  const open = smooth(clamp((prog - 0.78) / 0.22, 0, 1));
+  return {
+    pose: {
+      ...lerpPose(FLIP_TUCK, AIR_FALL, open),
+      rot: (forward ? -1 : 1) * 360 * smooth(prog),
+      px: FLIP_TUCK.px,
+      py: FLIP_TUCK.py,
+    },
+    rate: 35,
+  };
 }
 
 export function idlePose(frame: number, index: number): Pose {
@@ -617,6 +686,12 @@ export function targetPose(p: PlayerState, ctx: Ctx): Target {
       return { pose: HIT, rate: 40 };
     case ACT_BLOCKSTUN:
       return { pose: BLOCK, rate: 35 };
+    case ACT_STEP:
+      return { pose: stepPose(p), rate: 26 };
+    case ACT_DASH:
+      return { pose: dashPose(p), rate: 35 };
+    case ACT_FLIP:
+      return flipTarget(p);
     case ACT_JUMPSQUAT:
       // sink into the crouch over the wind-up, then spring
       return {
@@ -644,8 +719,6 @@ export function targetPose(p: PlayerState, ctx: Ctx): Target {
         return { pose: lerpPose(AIR_RISE, AIR_FALL, k), rate: 22 };
       }
       if (isCrouching(p)) return { pose: CROUCH, rate: 26 };
-      if ((p.prev & (Input.LEFT | Input.RIGHT)) !== 0)
-        return { pose: walkPose(p), rate: 20 };
       return { pose: idlePose(ctx.frame, ctx.index), rate: 20 };
     }
   }

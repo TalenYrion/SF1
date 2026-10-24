@@ -26,7 +26,8 @@ const WALK_SPEED = 3; // units per tick = 2.7 m/s, a brisk fighter's shuffle
 // 0.7 s, which a fit person can do. All values are multiples of 1/16, so the maths stays exact on every machine.
 export const JUMP_V = -3.875;
 const GRAVITY = 0.1875;
-export const JUMP_SQUAT = 9; // ticks of crouch (150 ms) before leaving the ground. A click during it turns the jump into an attack // ticks of crouch before leaving the ground (an attack can cancel it)
+export const JUMP_SQUAT = 10; // ticks of crouch (167 ms) before leaving the ground. A click during it turns the jump into an attack,
+// and a second tap of Q / E during it turns the leap into a flip
 
 // ---------- round ----------
 export const MAX_HP = 1000;
@@ -38,11 +39,29 @@ const ATTACK_BUFFER = 6; // ticks an early click is remembered
 const LEAP_BUFFER = JUMP_SQUAT + 3; // a click given with up-left / up-right waits for the leap to start
 const BLOCK_PERCENT = 20; // a blocked hit does this % of its damage
 const BLOCKSTUN = 8; // ticks a blocking fighter is pushed back and stuck
-const ROLL_WINDOW = 12; // ticks between two taps for a roll (12 = 200 ms)
+const TAP_WINDOW = 10; // ticks between two taps of a key for a double tap (10 = 167 ms)
 const ROLL_SPEED = 5;
 export const ROLL_MOVE = 20; // ticks spent moving
 export const ROLL_INVULN = 14; // ticks with no hurtbox
 export const ROLL_TOTAL = 26;
+
+// Stepping: holding A or D takes one quick step at a time. These tables are the units moved on each tick of a step,
+// so a step eases in and out. Stepping toward the opponent is quicker than stepping back.
+const STEP_FWD = [1, 2, 3, 4, 5, 5, 5, 4, 3, 2, 1, 1]; // 36 units = 0.54 m in 0.2 s
+const STEP_BACK = [1, 1, 2, 3, 3, 3, 3, 3, 2, 1, 1, 1]; // 24 units = 0.36 m in 0.2 s
+const STEP_PLANT = 2; // ticks with the feet planted before the next step
+export const STEP_TICKS = STEP_FWD.length + STEP_PLANT; // 14: one step every 0.23 s while a key is held
+
+// Dash: double tap toward the opponent
+const DASH = [3, 5, 7, 9, 9, 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1]; // 88 units = 1.3 m in 0.27 s
+const DASH_PLANT = 3;
+export const DASH_TICKS = DASH.length + DASH_PLANT;
+
+// Flip: double tap Q or E. A higher, longer jump with a somersault, over the opponent if need be.
+const FLIP_V = -4.75; // 0.9 m high
+export const FLIP_SQUAT = 4; // ticks of crouch before the spring
+const FLIP_SPEED = 3;
+export const FLIP_AIR = Math.round((2 * -FLIP_V) / GRAVITY); // about 51 ticks in the air
 
 // ---------- moves ----------
 export type Move = {
@@ -230,6 +249,9 @@ export const ACT_HITSTUN = 2;
 export const ACT_BLOCKSTUN = 3;
 export const ACT_ROLL = 4;
 export const ACT_JUMPSQUAT = 5;
+export const ACT_STEP = 6;
+export const ACT_DASH = 7;
+export const ACT_FLIP = 8;
 
 export type PlayerState = {
   x: number;
@@ -246,7 +268,7 @@ export type PlayerState = {
   buf: number; // ticks left on a remembered click
   bufAir: 0 | 1; // that click came with up-left or up-right, so it becomes an air attack after the leap
   bufMove: number; // the move that click asked for
-  tapDir: number; // direction of the last tap (-1 left, 1 right, 0 none)
+  tapCode: number; // the key combination (direction bits) last tapped, 0 for none
   tapAge: number; // ticks since that tap
   d1: number; // direction bits 1 tick ago
   d2: number; // direction bits 2 ticks ago
@@ -277,7 +299,7 @@ export function createInitialState(wins: [number, number] = [0, 0]): GameState {
     buf: 0,
     bufAir: 0 as const,
     bufMove: 0,
-    tapDir: 0,
+    tapCode: 0,
     tapAge: 255,
     d1: 0,
     d2: 0,
@@ -341,11 +363,6 @@ function moveIndex(kick: boolean, dir: number, facing: number): number {
 
 // ---------- one fighter, one tick ----------
 
-const ROLL_KEYS: [number, number][] = [
-  [Input.LEFT, -1],
-  [Input.RIGHT, 1],
-];
-
 /** Sideways speed for the direction bits held: walking speed left or right, or 0 */
 const side = (d: number) =>
   (d & Input.RIGHT ? WALK_SPEED : 0) - (d & Input.LEFT ? WALK_SPEED : 0);
@@ -368,7 +385,7 @@ function moveFighter(
     buf,
     bufAir,
     bufMove,
-    tapDir,
+    tapCode,
     tapAge,
   } = p;
   const grounded = y === GROUND_Y;
@@ -390,55 +407,93 @@ function moveFighter(
     if (buf === 0) bufAir = 0;
   }
 
-  // Double tap: a fresh press of the same side within ROLL_WINDOW ticks of the previous one
+  // Double taps. A key (or pair of keys, like Q = up + left) counts as freshly pressed when it differs from last
+  // tick. Two presses of the same key within TAP_WINDOW ticks are a double tap:
+  //   A / D toward the opponent = dash,  Z / C = roll,  Q / E = flip
   tapAge = Math.min(tapAge + 1, 255);
-  let rollDir = 0;
-  for (const [bit, d] of ROLL_KEYS) {
-    if (!pressed(bit)) continue;
-    if (tapDir === d && tapAge <= ROLL_WINDOW) {
-      rollDir = d;
-      tapDir = 0;
+  let dbl = 0;
+  if (dirNow !== 0 && dirNow !== (p.prev & DIR_MASK)) {
+    if (tapCode === dirNow && tapAge <= TAP_WINDOW) {
+      dbl = dirNow;
+      tapCode = 0;
     } else {
-      tapDir = d;
+      tapCode = dirNow;
       tapAge = 0;
     }
   }
+  const sx = dbl & Input.RIGHT ? 1 : -1; // the way the double tap went
+  const isDash = (dbl === Input.LEFT || dbl === Input.RIGHT) && sx * facing > 0; // forward only
+  const isRoll =
+    dbl === (Input.DOWN | Input.LEFT) || dbl === (Input.DOWN | Input.RIGHT);
+  const isFlip =
+    dbl === (Input.UP | Input.LEFT) || dbl === (Input.UP | Input.RIGHT);
 
-  if (act === ACT_FREE) {
-    if (grounded && rollDir !== 0) {
+  if (act === ACT_FREE || act === ACT_STEP) {
+    if (grounded && isRoll) {
       act = ACT_ROLL;
       t = 0;
-      vx = rollDir * ROLL_SPEED;
+      vx = sx * ROLL_SPEED;
+    } else if (grounded && isDash) {
+      act = ACT_DASH;
+      t = 0;
+      vx = facing;
+    } else if (grounded && isFlip) {
+      act = ACT_FLIP;
+      t = 0;
+      vx = sx * FLIP_SPEED;
     } else if (grounded && buf > 0 && !bufAir) {
       act = ACT_ATTACK;
       t = 0;
       hit = 0;
       mv = bufMove;
       buf = 0;
+      vx = 0;
     } else if (grounded && input & Input.UP) {
       act = ACT_JUMPSQUAT;
       t = 0;
       vx = side(dirNow || p.d1 || p.d2); // the leap direction, if one is held
-    } else if (grounded && input & Input.DOWN) {
-      // crouching: no walking, shorter hurtbox
-    } else if (!grounded && buf > 0) {
-      // a click in the air: air punch or air kick
-      act = ACT_ATTACK;
-      t = 0;
-      hit = 0;
-      mv = bufMove >= 5 ? AIR_KICK : AIR_PUNCH;
-      buf = 0;
-      bufAir = 0;
-    } else if (grounded) {
-      if (input & Input.LEFT) x -= WALK_SPEED;
-      if (input & Input.RIGHT) x += WALK_SPEED;
+    } else if (!grounded) {
+      if (buf > 0) {
+        // a click in the air: air punch or air kick
+        act = ACT_ATTACK;
+        t = 0;
+        hit = 0;
+        mv = bufMove >= 5 ? AIR_KICK : AIR_PUNCH;
+        buf = 0;
+        bufAir = 0;
+      } else {
+        x += vx; // in the air the body keeps the speed it left the ground with: no steering
+      }
     } else {
-      x += vx; // in the air the body keeps the speed it left the ground with: no steering
+      // On the ground. Holding A or D starts a step; a step plays through and the next one starts if the key is still held.
+      if (act === ACT_FREE && !(input & Input.DOWN)) {
+        const h = (input & Input.RIGHT ? 1 : 0) - (input & Input.LEFT ? 1 : 0);
+        if (h !== 0) {
+          act = ACT_STEP;
+          t = 0;
+          vx = h;
+        }
+      }
+      if (act === ACT_STEP) {
+        const table = vx * facing > 0 ? STEP_FWD : STEP_BACK;
+        if (t < table.length) x += vx * table[t];
+        t++;
+        if (t >= table.length + STEP_PLANT) {
+          act = ACT_FREE;
+          t = 0;
+          vx = 0;
+        }
+      }
     }
   } else if (act === ACT_JUMPSQUAT) {
     t++;
     if (dirNow & (Input.LEFT | Input.RIGHT)) vx = side(dirNow); // the last direction held is the leap direction
-    if (buf > 0 && !bufAir) {
+    if (isFlip) {
+      // a second tap of Q / E: the leap becomes a flip
+      act = ACT_FLIP;
+      t = 0;
+      vx = sx * FLIP_SPEED;
+    } else if (buf > 0 && !bufAir) {
       // up + click: the crouch turns into the attack (uppercut / high kick), whether or not up is still held
       act = ACT_ATTACK;
       t = 0;
@@ -461,6 +516,19 @@ function moveFighter(
       t = 0;
       hit = 0;
     }
+  } else if (act === ACT_DASH) {
+    if (t < DASH.length) x += vx * DASH[t];
+    t++;
+    if (t >= DASH.length + DASH_PLANT) {
+      act = ACT_FREE;
+      t = 0;
+      vx = 0;
+    }
+  } else if (act === ACT_FLIP) {
+    t++;
+    if (t === FLIP_SQUAT)
+      vy = FLIP_V; // spring off the ground
+    else if (t > FLIP_SQUAT) x += vx; // then fly along the arc: no steering
   } else if (act === ACT_ROLL) {
     if (t < ROLL_MOVE) x += vx;
     t++;
@@ -487,6 +555,11 @@ function moveFighter(
     y = GROUND_Y;
     vy = 0;
     if (act === ACT_FREE || act === ACT_ATTACK) vx = 0; // landing ends the jump's sideways speed
+    if (act === ACT_FLIP && t > FLIP_SQUAT) {
+      act = ACT_FREE; // landed from the flip
+      t = 0;
+      vx = 0;
+    }
   }
   x = clamp(x, HALF_W, WIDTH - HALF_W);
 
@@ -510,7 +583,7 @@ function moveFighter(
     buf,
     bufAir,
     bufMove,
-    tapDir,
+    tapCode,
     tapAge,
     d1: dirNow,
     d2: p.d1,
@@ -606,9 +679,11 @@ export function step(state: GameState, inputs: Inputs): GameState {
   const [a0, b0] = state.players;
   const m0 = moveFighter(a0, b0, live[0]);
   const m1 = moveFighter(b0, a0, live[1]);
-  // A rolling fighter passes through the opponent, so nobody is pushed while a roll is running
-  const rolling = m0.act === ACT_ROLL || m1.act === ACT_ROLL;
-  const [a, b] = rolling ? [m0, m1] : separate(m0, m1);
+  // A rolling or flipping fighter passes through the opponent, so nobody is pushed while one is running
+  const passing = [m0.act, m1.act].some(
+    (x) => x === ACT_ROLL || x === ACT_FLIP,
+  );
+  const [a, b] = passing ? [m0, m1] : separate(m0, m1);
 
   let na = a;
   let nb = b;
@@ -690,7 +765,7 @@ export function checksum(s: GameState): number {
     mix(p.buf);
     mix(p.bufAir);
     mix(p.bufMove);
-    mix(p.tapDir);
+    mix(p.tapCode);
     mix(p.tapAge);
     mix(p.d1);
     mix(p.d2);
