@@ -57,11 +57,14 @@ const DASH = [3, 5, 7, 9, 9, 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1]; // 88 units = 1.3
 const DASH_PLANT = 3;
 export const DASH_TICKS = DASH.length + DASH_PLANT;
 
-// Flip: double tap Q or E. A higher, longer jump with a somersault, over the opponent if need be.
-const FLIP_V = -4.75; // 0.9 m high
+// Flip: double tap Q or E. A somersault that carries you through the opponent if need be.
+// From the moment the feet leave the ground to standing again it takes exactly 1 second:
+// 44 ticks in the air (0.73 s, 0.71 m high) and 16 ticks to absorb the landing and stand up.
+const FLIP_V = -4.125;
 export const FLIP_SQUAT = 4; // ticks of crouch before the spring
 const FLIP_SPEED = 3;
-export const FLIP_AIR = Math.round((2 * -FLIP_V) / GRAVITY); // about 51 ticks in the air
+export const FLIP_AIR = 44; // ticks from leaving the ground to touching down (checked by the tests against the real arc)
+export const FLIP_TOTAL = 60; // ticks from leaving the ground to standing again
 
 // ---------- moves ----------
 export type Move = {
@@ -528,7 +531,12 @@ function moveFighter(
     t++;
     if (t === FLIP_SQUAT)
       vy = FLIP_V; // spring off the ground
-    else if (t > FLIP_SQUAT) x += vx; // then fly along the arc: no steering
+    else if (t > FLIP_SQUAT) x += vx; // then fly along the arc: no steering (vx is 0 again once landed)
+    if (t >= FLIP_SQUAT + FLIP_TOTAL) {
+      act = ACT_FREE; // standing again
+      t = 0;
+      vx = 0;
+    }
   } else if (act === ACT_ROLL) {
     if (t < ROLL_MOVE) x += vx;
     t++;
@@ -555,11 +563,7 @@ function moveFighter(
     y = GROUND_Y;
     vy = 0;
     if (act === ACT_FREE || act === ACT_ATTACK) vx = 0; // landing ends the jump's sideways speed
-    if (act === ACT_FLIP && t > FLIP_SQUAT) {
-      act = ACT_FREE; // landed from the flip
-      t = 0;
-      vx = 0;
-    }
+    if (act === ACT_FLIP && t > FLIP_SQUAT) vx = 0; // touched down: the rest of the flip is the landing, with no sliding
   }
   x = clamp(x, HALF_W, WIDTH - HALF_W);
 
@@ -679,9 +683,9 @@ export function step(state: GameState, inputs: Inputs): GameState {
   const [a0, b0] = state.players;
   const m0 = moveFighter(a0, b0, live[0]);
   const m1 = moveFighter(b0, a0, live[1]);
-  // A rolling or flipping fighter passes through the opponent, so nobody is pushed while one is running
+  // A rolling, dashing or flipping fighter passes through the opponent, so nobody is pushed while one is running
   const passing = [m0.act, m1.act].some(
-    (x) => x === ACT_ROLL || x === ACT_FLIP,
+    (x) => x === ACT_ROLL || x === ACT_DASH || x === ACT_FLIP,
   );
   const [a, b] = passing ? [m0, m1] : separate(m0, m1);
 

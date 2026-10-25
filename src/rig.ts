@@ -20,6 +20,7 @@ import {
   DASH_TICKS,
   FLIP_SQUAT,
   FLIP_AIR,
+  FLIP_TOTAL,
   isCrouching,
   type PlayerState,
 } from './sim';
@@ -628,7 +629,10 @@ export function dashPose(p: PlayerState): Pose {
   return lerpPose(STANCE, DASH_POSE, into * (1 - out));
 }
 
-/** Crouch, spring, then a tucked somersault over the whole time in the air. */
+/**
+ * A flip: crouch, spring, a fast tucked somersault, open up, absorb the landing and stand.
+ * `air` counts ticks since the feet left the ground; they touch down at FLIP_AIR and stand at FLIP_TOTAL (1 second).
+ */
 export function flipTarget(p: PlayerState): Target {
   if (p.t <= FLIP_SQUAT) {
     return {
@@ -636,14 +640,23 @@ export function flipTarget(p: PlayerState): Target {
       rate: 35,
     };
   }
-  const prog = clamp((p.t - FLIP_SQUAT) / FLIP_AIR, 0, 1);
+  const air = p.t - FLIP_SQUAT;
+  if (air >= FLIP_AIR) {
+    // landed: sink into a crouch to take the impact, then stand up
+    const l = clamp((air - FLIP_AIR) / (FLIP_TOTAL - FLIP_AIR), 0, 1);
+    return { pose: lerpPose(JUMPSQUAT, STANCE, smooth(l)), rate: 30 };
+  }
+  const prog = clamp(air / (FLIP_AIR - 1), 0, 1);
+  // The body turns one full circle by 90% of the flight, at a nearly even speed (a real flip does not drift),
+  // then hangs upright for the last tenth to land.
+  const r = clamp(prog / 0.9, 0, 1);
+  const turned = 0.5 * r + 0.5 * smooth(r);
   const forward = p.vx * p.facing > 0;
-  // tucked through the middle of the flip, opening up again for the landing
-  const open = smooth(clamp((prog - 0.78) / 0.22, 0, 1));
+  const open = smooth(clamp((prog - 0.72) / 0.23, 0, 1)); // untuck for the landing
   return {
     pose: {
       ...lerpPose(FLIP_TUCK, AIR_FALL, open),
-      rot: (forward ? -1 : 1) * 360 * smooth(prog),
+      rot: (forward ? -1 : 1) * 360 * turned,
       px: FLIP_TUCK.px,
       py: FLIP_TUCK.py,
     },
