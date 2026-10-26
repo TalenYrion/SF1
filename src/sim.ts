@@ -21,7 +21,6 @@ export const FIGHTER_W = 60;
 export const FIGHTER_H = 120;
 export const CROUCH_H = 70;
 const HALF_W = FIGHTER_W / 2;
-const WALK_SPEED = 3; // units per tick = 2.7 m/s, a brisk fighter's shuffle
 // Real gravity (9.8 m/s^2) at this scale is 0.18 units/tick^2. These values give a 0.6 m jump that hangs for
 // 0.7 s, which a fit person can do. All values are multiples of 1/16, so the maths stays exact on every machine.
 export const JUMP_V = -3.875;
@@ -36,7 +35,9 @@ export const RESTART_TICKS = 180;
 
 // ---------- combat tuning ----------
 const ATTACK_BUFFER = 6; // ticks an early click is remembered
-const LEAP_BUFFER = JUMP_SQUAT + 3; // a click given with up-left / up-right waits for the leap to start
+export const LEAP_SQUAT = 5; // ticks of crouch before a leap kick springs (83 ms, quicker than a plain jump)
+const LEAP_SPEED = 3; // sideways speed of a leap kick, units per tick
+const LEAP_BUFFER = JUMP_SQUAT + 3; // a kick given with Q or E waits for the leap to start
 const BLOCK_PERCENT = 20; // a blocked hit does this % of its damage
 const BLOCKSTUN = 8; // ticks a blocking fighter is pushed back and stuck
 const TAP_WINDOW = 10; // ticks between two taps of a key for a double tap (10 = 167 ms)
@@ -241,9 +242,24 @@ export const MOVES: Move[] = [
     height: 55,
     lunge: 0,
   },
+  // Q or E + punch: a stepping-in uppercut with the lead hand. Reaches further than the W uppercut (45), less than a kick (58).
+  {
+    name: 'lunge uppercut',
+    startup: 12,
+    active: 4,
+    recovery: 22,
+    damage: 135,
+    stun: 24,
+    knockback: 13,
+    reach: 54,
+    top: 118,
+    height: 46,
+    lunge: 2,
+  },
 ];
 export const AIR_PUNCH = 10;
 export const AIR_KICK = 11;
+export const LUNGE_UPPERCUT = 12;
 
 // ---------- actions ----------
 export const ACT_FREE = 0;
@@ -269,7 +285,7 @@ export type PlayerState = {
   mv: number; // index into MOVES of the current attack
   prev: number; // last tick's input
   buf: number; // ticks left on a remembered click
-  bufAir: 0 | 1; // that click came with up-left or up-right, so it becomes an air attack after the leap
+  bufLeap: number; // -1 / +1 when the buffered click is a leap kick (kick + Q or E) toward that side, else 0
   bufMove: number; // the move that click asked for
   tapCode: number; // the key combination (direction bits) last tapped, 0 for none
   tapAge: number; // ticks since that tap
@@ -300,7 +316,7 @@ export function createInitialState(wins: [number, number] = [0, 0]): GameState {
     mv: 0,
     prev: 0,
     buf: 0,
-    bufAir: 0 as const,
+    bufLeap: 0,
     bufMove: 0,
     tapCode: 0,
     tapAge: 255,
@@ -357,18 +373,16 @@ const overlaps = (a: Box, b: Box) =>
 function moveIndex(kick: boolean, dir: number, facing: number): number {
   const h = (dir & Input.RIGHT ? 1 : 0) - (dir & Input.LEFT ? 1 : 0);
   let v = 0; // 0 neutral, 1 forward, 2 back, 3 up, 4 down. Diagonals pick up or down for now.
-  if (dir & Input.UP) v = 3;
-  else if (dir & Input.DOWN) v = 4;
+  if (dir & Input.UP) {
+    if (h !== 0 && !kick) return LUNGE_UPPERCUT; // Q or E + punch
+    v = 3; // W + punch / kick: uppercut / high kick
+  } else if (dir & Input.DOWN) v = 4;
   else if (h * facing > 0) v = 1;
   else if (h * facing < 0) v = 2;
   return (kick ? 5 : 0) + v;
 }
 
 // ---------- one fighter, one tick ----------
-
-/** Sideways speed for the direction bits held: walking speed left or right, or 0 */
-const side = (d: number) =>
-  (d & Input.RIGHT ? WALK_SPEED : 0) - (d & Input.LEFT ? WALK_SPEED : 0);
 
 function moveFighter(
   p: PlayerState,
@@ -386,7 +400,7 @@ function moveFighter(
     hit,
     mv,
     buf,
-    bufAir,
+    bufLeap,
     bufMove,
     tapCode,
     tapAge,
@@ -401,13 +415,15 @@ function moveFighter(
   if (punchPressed || kickPressed) {
     const dirW = dirNow || p.d1 || p.d2;
     bufMove = moveIndex(!punchPressed, dirW, facing);
-    // Up together with left or right is a leap: the click waits and becomes an air attack once airborne.
-    // Up on its own (W) is the uppercut / high kick and never needs a jump.
-    bufAir = dirW & Input.UP && dirW & (Input.LEFT | Input.RIGHT) ? 1 : 0;
-    buf = bufAir ? LEAP_BUFFER : ATTACK_BUFFER;
+    // Kick + Q or E (up with left or right) is the leap kick: the kick waits while the fighter springs into the air.
+    // Punch + Q or E is the lunge uppercut and W on its own is the plain uppercut / high kick: neither jumps.
+    const h = (dirW & Input.RIGHT ? 1 : 0) - (dirW & Input.LEFT ? 1 : 0);
+    bufLeap =
+      kickPressed && !punchPressed && dirW & Input.UP && h !== 0 ? h : 0;
+    buf = bufLeap !== 0 ? LEAP_BUFFER : ATTACK_BUFFER;
   } else {
     buf = Math.max(0, buf - 1);
-    if (buf === 0) bufAir = 0;
+    if (buf === 0) bufLeap = 0;
   }
 
   // Double taps. A key (or pair of keys, like Q = up + left) counts as freshly pressed when it differs from last
@@ -444,32 +460,42 @@ function moveFighter(
       act = ACT_FLIP;
       t = 0;
       vx = sx * FLIP_SPEED;
-    } else if (grounded && buf > 0 && !bufAir) {
+    } else if (grounded && buf > 0 && bufLeap === 0) {
       act = ACT_ATTACK;
       t = 0;
       hit = 0;
       mv = bufMove;
       buf = 0;
       vx = 0;
-    } else if (grounded && input & Input.UP) {
+    } else if (grounded && buf > 0) {
+      // leap kick: a short crouch, then spring toward the side that was pressed. The kick itself fires in the air.
       act = ACT_JUMPSQUAT;
       t = 0;
-      vx = side(dirNow || p.d1 || p.d2); // the leap direction, if one is held
+      vx = bufLeap * LEAP_SPEED;
+    } else if (
+      grounded &&
+      input & Input.UP &&
+      !(input & (Input.LEFT | Input.RIGHT))
+    ) {
+      // W on its own: a jump straight up. (Q and E do nothing by themselves.)
+      act = ACT_JUMPSQUAT;
+      t = 0;
+      vx = 0;
     } else if (!grounded) {
       if (buf > 0) {
         // a click in the air: air punch or air kick
         act = ACT_ATTACK;
         t = 0;
         hit = 0;
-        mv = bufMove >= 5 ? AIR_KICK : AIR_PUNCH;
+        mv = bufMove >= 5 && bufMove <= 9 ? AIR_KICK : AIR_PUNCH;
         buf = 0;
-        bufAir = 0;
+        bufLeap = 0;
       } else {
         x += vx; // in the air the body keeps the speed it left the ground with: no steering
       }
     } else {
       // On the ground. Holding A or D starts a step; a step plays through and the next one starts if the key is still held.
-      if (act === ACT_FREE && !(input & Input.DOWN)) {
+      if (act === ACT_FREE && !(input & Input.DOWN) && !(input & Input.UP)) {
         const h = (input & Input.RIGHT ? 1 : 0) - (input & Input.LEFT ? 1 : 0);
         if (h !== 0) {
           act = ACT_STEP;
@@ -490,21 +516,25 @@ function moveFighter(
     }
   } else if (act === ACT_JUMPSQUAT) {
     t++;
-    if (dirNow & (Input.LEFT | Input.RIGHT)) vx = side(dirNow); // the last direction held is the leap direction
     if (isFlip) {
-      // a second tap of Q / E: the leap becomes a flip
+      // a double tap of Q / E: the crouch becomes a flip
       act = ACT_FLIP;
       t = 0;
       vx = sx * FLIP_SPEED;
-    } else if (buf > 0 && !bufAir) {
-      // up + click: the crouch turns into the attack (uppercut / high kick), whether or not up is still held
+    } else if (buf > 0 && bufLeap === 0) {
+      // W + click: the crouch turns into the attack (uppercut / high kick), whether or not W is still held
       act = ACT_ATTACK;
       t = 0;
       hit = 0;
-      mv = bufMove >= 5 ? 8 : 3;
+      mv =
+        bufMove === LUNGE_UPPERCUT
+          ? LUNGE_UPPERCUT
+          : bufMove >= 5 && bufMove <= 9
+            ? 8
+            : 3;
       buf = 0;
       vx = 0;
-    } else if (t >= JUMP_SQUAT) {
+    } else if (t >= (vx !== 0 ? LEAP_SQUAT : JUMP_SQUAT)) {
       act = ACT_FREE;
       t = 0;
       vy = JUMP_V;
@@ -512,7 +542,7 @@ function moveFighter(
   } else if (act === ACT_ATTACK) {
     const m = MOVES[mv];
     if (t < m.startup) x += facing * m.lunge;
-    if (mv >= AIR_PUNCH && !grounded) x += vx; // an air attack carries on along the jump
+    if ((mv === AIR_PUNCH || mv === AIR_KICK) && !grounded) x += vx; // an air attack carries on along the jump
     t++;
     if (t >= m.startup + m.active + m.recovery) {
       act = ACT_FREE;
@@ -585,7 +615,7 @@ function moveFighter(
     mv,
     prev: input,
     buf,
-    bufAir,
+    bufLeap,
     bufMove,
     tapCode,
     tapAge,
@@ -767,7 +797,7 @@ export function checksum(s: GameState): number {
     mix(p.mv);
     mix(p.prev);
     mix(p.buf);
-    mix(p.bufAir);
+    mix(p.bufLeap);
     mix(p.bufMove);
     mix(p.tapCode);
     mix(p.tapAge);

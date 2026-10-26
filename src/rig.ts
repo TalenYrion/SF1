@@ -18,6 +18,7 @@ import {
   JUMP_SQUAT,
   STEP_TICKS,
   DASH_TICKS,
+  LEAP_SQUAT,
   FLIP_SQUAT,
   FLIP_AIR,
   FLIP_TOTAL,
@@ -564,6 +565,34 @@ export const ANIMS: Anim[] = [
       rhy: 92,
     }),
   },
+  // 12 lunge uppercut (Q or E + punch): coil forward, then drive in and up with the lead hand
+  {
+    strike: 'lh',
+    wind: P({
+      hx: 10,
+      hy: 44,
+      lean: 26,
+      lhx: 12,
+      lhy: 46,
+      rhx: 30,
+      rhy: 88,
+      lfx: 24,
+      rfx: -20,
+    }),
+    hit: P({
+      hx: 28,
+      hy: 62,
+      lean: 14,
+      tilt: -8,
+      lhx: 82,
+      lhy: 104,
+      rhx: 38,
+      rhy: 94,
+      lfx: 50,
+      lfy: 0,
+      rfx: 2,
+    }),
+  },
 ];
 
 const clamp = (v: number, a: number, b: number) => Math.min(Math.max(v, a), b);
@@ -711,7 +740,13 @@ export function targetPose(p: PlayerState, ctx: Ctx): Target {
         pose: lerpPose(
           STANCE,
           JUMPSQUAT,
-          smooth(clamp((p.t + 1) / (JUMP_SQUAT * 0.7), 0, 1)),
+          smooth(
+            clamp(
+              (p.t + 1) / ((p.vx !== 0 ? LEAP_SQUAT : JUMP_SQUAT) * 0.7),
+              0,
+              1,
+            ),
+          ),
         ),
         rate: 30,
       };
