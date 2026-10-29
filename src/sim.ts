@@ -5,14 +5,7 @@ export const HEIGHT = 270;
 export const TICK_RATE = 60;
 
 // Input bits. The keys Q/E/Z/C are shortcuts that set two direction bits at once.
-export const Input = {
-  UP: 1,
-  DOWN: 2,
-  LEFT: 4,
-  RIGHT: 8,
-  PUNCH: 16,
-  KICK: 32,
-} as const;
+export const Input = { UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8, PUNCH: 16, KICK: 32 } as const;
 const DIR_MASK = 15;
 
 // ---------- body and movement ----------
@@ -21,12 +14,15 @@ export const FIGHTER_W = 60;
 export const FIGHTER_H = 120;
 export const CROUCH_H = 70;
 const HALF_W = FIGHTER_W / 2;
-// Real gravity (9.8 m/s^2) at this scale is 0.18 units/tick^2. These values give a 0.6 m jump that hangs for
-// 0.7 s, which a fit person can do. All values are multiples of 1/16, so the maths stays exact on every machine.
-export const JUMP_V = -3.875;
-const GRAVITY = 0.1875;
-export const JUMP_SQUAT = 10; // ticks of crouch (167 ms) before leaving the ground. A click during it turns the jump into an attack,
-// and a second tap of Q / E during it turns the leap into a flip
+// Jump physics. The Shadow Fight 2 timing data gives a jump 16 frames (32 ticks) in the air. Gravity here is 1.7 g, a little
+// stronger than real so a jump looks snappy rather than floaty, and the takeoff speed gives a 0.64 m jump. (The same data
+// also says "1.5x character height", which would be a 2.7 m jump. That contradicts the request for realistic physics, so
+// the height stays realistic. For an air time of N ticks and a height of H units, GRAVITY = 8H/N^2 and JUMP_V = -4H/N.)
+// All values are multiples of 1/16, so the maths stays exact on every machine.
+export const JUMP_V = -5;
+const GRAVITY = 0.3125;
+export const JUMP_SQUAT = 8;  // 4 frames (133 ms) of crouch. A click during it turns the jump into an uppercut / high kick
+export const JUMP_LAND = 8;   // 4 frames of landing, so a whole jump is 24 frames (0.8 s)
 
 // ---------- round ----------
 export const MAX_HP = 1000;
@@ -34,228 +30,103 @@ export const ROUND_TICKS = 99 * TICK_RATE; // 99 seconds
 export const RESTART_TICKS = 180;
 
 // ---------- combat tuning ----------
-const ATTACK_BUFFER = 6; // ticks an early click is remembered
-export const LEAP_SQUAT = 5; // ticks of crouch before a leap kick springs (83 ms, quicker than a plain jump)
-const LEAP_SPEED = 3; // sideways speed of a leap kick, units per tick
-const LEAP_BUFFER = JUMP_SQUAT + 3; // a kick given with Q or E waits for the leap to start
+const ATTACK_BUFFER = 6;  // ticks an early click is remembered
+export const LEAP_SQUAT = 10; // leap kick: 5 frames (167 ms) of crouch before the spring
+const LEAP_SPEED = 4;         // sideways speed of a leap kick, units per tick
+const LEAP_BUFFER = LEAP_SQUAT + 4; // a kick given with Q or E waits for the leap to start
 const BLOCK_PERCENT = 20; // a blocked hit does this % of its damage
-const BLOCKSTUN = 8; // ticks a blocking fighter is pushed back and stuck
-const TAP_WINDOW = 10; // ticks between two taps of a key for a double tap (10 = 167 ms)
-const ROLL_SPEED = 5;
-export const ROLL_MOVE = 20; // ticks spent moving
-export const ROLL_INVULN = 14; // ticks with no hurtbox
-export const ROLL_TOTAL = 26;
+const BLOCKSTUN = 8;      // ticks a blocking fighter is pushed back and stuck
+const TAP_WINDOW = 10;    // ticks between two taps of a key for a double tap (10 = 167 ms)
+const LUNGE_TICKS = 11;   // a move that steps in does it over the last 11 ticks of its startup
 
-// Stepping: holding A or D takes one quick step at a time. These tables are the units moved on each tick of a step,
-// so a step eases in and out. Stepping toward the opponent is quicker than stepping back.
-const STEP_FWD = [1, 2, 3, 4, 5, 5, 5, 4, 3, 2, 1, 1]; // 36 units = 0.54 m in 0.2 s
-const STEP_BACK = [1, 1, 2, 3, 3, 3, 3, 3, 2, 1, 1, 1]; // 24 units = 0.36 m in 0.2 s
-const STEP_PLANT = 2; // ticks with the feet planted before the next step
-export const STEP_TICKS = STEP_FWD.length + STEP_PLANT; // 14: one step every 0.23 s while a key is held
+// ---------- movement timing, from the Shadow Fight 2 data (30 frames per second, so 1 frame = 2 ticks) ----------
+// The data measures distance in "body-lengths". One body-length here is the width of a fighter (60 units, 0.9 m).
+// If it should be the height instead, set BODY_LENGTH to FIGHTER_H and every distance below doubles.
+const BODY_LENGTH = FIGHTER_W;
 
-// Dash: double tap toward the opponent
-const DASH = [3, 5, 7, 9, 9, 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1]; // 88 units = 1.3 m in 0.27 s
-const DASH_PLANT = 3;
-export const DASH_TICKS = DASH.length + DASH_PLANT;
+const easeInOut = (x: number) => x * x * (3 - 2 * x);
+const easeOut = (x: number) => 1 - (1 - x) * (1 - x);
 
-// Flip: double tap Q or E. A somersault that carries you through the opponent if need be.
-// From the moment the feet leave the ground to standing again it takes exactly 1 second:
-// 44 ticks in the air (0.73 s, 0.71 m high) and 16 ticks to absorb the landing and stand up.
-const FLIP_V = -4.125;
-export const FLIP_SQUAT = 4; // ticks of crouch before the spring
+/** Splits `total` units into whole units per tick over `ticks` ticks, following an easing curve */
+function profile(total: number, ticks: number, ease: (x: number) => number): number[] {
+  const out: number[] = [];
+  let before = 0;
+  for (let i = 1; i <= ticks; i++) {
+    const upTo = Math.round(total * ease(i / ticks));
+    out.push(upTo - before);
+    before = upTo;
+  }
+  return out;
+}
+
+// Step: 12 frames (0.4 s) and 0.75 body-lengths, forward or back
+const STEP_FWD = profile(0.75 * BODY_LENGTH, 20, easeInOut); // 45 units over 20 ticks
+const STEP_BACK = STEP_FWD;
+const STEP_PLANT = 4;                                        // ticks with the feet planted before the next step
+export const STEP_TICKS = STEP_FWD.length + STEP_PLANT;      // 24
+
+// Dash: double tap toward the opponent. 18 frames (0.6 s), 1.75 body-lengths, no invulnerability
+const DASH = profile(1.75 * BODY_LENGTH, 26, easeOut);       // 105 units, fastest at the start
+const DASH_PLANT = 10;
+export const DASH_TICKS = DASH.length + DASH_PLANT;          // 36
+
+// Roll: double tap Z or C. 24 frames (0.8 s) and 2.25 body-lengths. From frame 4 to 16 the fighter is low enough
+// that high attacks pass over (a low profile, not invulnerability).
+const ROLL = profile(2.25 * BODY_LENGTH, 40, easeInOut);     // 135 units over 40 ticks
+export const ROLL_MOVE = ROLL.length;
+export const ROLL_TOTAL = 48;
+const ROLL_LOW_FROM = 8;
+const ROLL_LOW_TO = 32;
+const ROLL_H = 36;                                           // hurtbox height while rolling low
+
+// Flip: double tap Q or E. 30 frames (1 s) in all: a 4 frame crouch, then the somersault, then the landing.
+// Invulnerable from frame 1 to 12. It carries you through the opponent if need be.
+const FLIP_V = -5.5;                                         // 0.77 m high
+export const FLIP_SQUAT = 8;                                 // ticks of crouch before the spring (included in the 1 s)
 const FLIP_SPEED = 3;
-export const FLIP_AIR = 44; // ticks from leaving the ground to touching down (checked by the tests against the real arc)
-export const FLIP_TOTAL = 60; // ticks from leaving the ground to standing again
+export const FLIP_AIR = 36;                                  // ticks from leaving the ground to touching down (the tests check this against the real arc)
+export const FLIP_TOTAL = 52;                                // ticks from leaving the ground to standing again (8 + 52 = 60 ticks = 1 s)
+const FLIP_SAFE_FROM = 2;
+const FLIP_SAFE_TO = 24;
 
 // ---------- moves ----------
 export type Move = {
   name: string;
-  startup: number; // ticks before the hitbox appears
-  active: number; // ticks the hitbox is live
+  startup: number;  // ticks before the hitbox appears
+  active: number;   // ticks the hitbox is live
   recovery: number; // ticks of helplessness afterwards
-  damage: number; // out of MAX_HP
-  stun: number; // ticks the victim is stuck if the hit lands
+  damage: number;   // out of MAX_HP
+  stun: number;     // ticks the victim is stuck if the hit lands
   knockback: number;
-  reach: number; // hitbox length past the fighter's front edge
-  top: number; // hitbox top edge, in pixels above the feet
+  reach: number;    // hitbox length past the fighter's front edge
+  top: number;      // hitbox top edge, in pixels above the feet
   height: number;
-  lunge: number; // pixels moved forward per tick during startup
+  lunge: number;    // units moved forward per tick over the last LUNGE_TICKS ticks of startup
 };
 
+// Timings are the Shadow Fight 2 figures (start to impact, active, and total length, at 30 fps) doubled to ticks:
+// punch 7/2/18 frames, strong punch 14/3/32, spin punch 12/3/26, uppercut 11.5/3/28, low punch 9/2/20, front kick 9.5/2/24,
+// back kick 11/2/26, high kick 10/2/22, sweep 8/3/20, and the leap kick (air kick) 12/3/30 after takeoff.
+// Hit stun is not in the data, so each move keeps the advantage it had before: stun = old stun + (new recovery - old recovery).
+// The plain kick, air punch and lunge uppercut have no figures, so they are scaled to sit with the others.
 // Ground moves: index = (kick ? 5 : 0) + direction, with direction 0 neutral, 1 forward, 2 back, 3 up, 4 down.
-// Indexes 10 and 11 are the air moves.
+// Indexes 10 and 11 are the air moves and 12 is the lunge uppercut.
 export const MOVES: Move[] = [
-  {
-    name: 'punch',
-    startup: 6,
-    active: 3,
-    recovery: 10,
-    damage: 50,
-    stun: 14,
-    knockback: 5,
-    reach: 50,
-    top: 100,
-    height: 30,
-    lunge: 0,
-  },
-  {
-    name: 'strong punch',
-    startup: 11,
-    active: 4,
-    recovery: 15,
-    damage: 90,
-    stun: 18,
-    knockback: 8,
-    reach: 58,
-    top: 95,
-    height: 35,
-    lunge: 3,
-  },
-  {
-    name: 'spin punch',
-    startup: 13,
-    active: 4,
-    recovery: 18,
-    damage: 110,
-    stun: 20,
-    knockback: 10,
-    reach: 72,
-    top: 95,
-    height: 36,
-    lunge: 0,
-  },
-  {
-    name: 'uppercut',
-    startup: 10,
-    active: 4,
-    recovery: 20,
-    damage: 120,
-    stun: 24,
-    knockback: 12,
-    reach: 45,
-    top: 125,
-    height: 50,
-    lunge: 0,
-  },
-  {
-    name: 'low punch',
-    startup: 9,
-    active: 3,
-    recovery: 14,
-    damage: 70,
-    stun: 18,
-    knockback: 6,
-    reach: 55,
-    top: 45,
-    height: 30,
-    lunge: 0,
-  },
-  {
-    name: 'kick',
-    startup: 8,
-    active: 3,
-    recovery: 13,
-    damage: 70,
-    stun: 16,
-    knockback: 6,
-    reach: 58,
-    top: 60,
-    height: 30,
-    lunge: 0,
-  },
-  {
-    name: 'front kick',
-    startup: 12,
-    active: 4,
-    recovery: 17,
-    damage: 100,
-    stun: 20,
-    knockback: 11,
-    reach: 68,
-    top: 70,
-    height: 34,
-    lunge: 2,
-  },
-  {
-    name: 'back kick',
-    startup: 14,
-    active: 4,
-    recovery: 20,
-    damage: 115,
-    stun: 22,
-    knockback: 12,
-    reach: 78,
-    top: 85,
-    height: 36,
-    lunge: 0,
-  },
-  {
-    name: 'high kick',
-    startup: 12,
-    active: 4,
-    recovery: 20,
-    damage: 105,
-    stun: 22,
-    knockback: 10,
-    reach: 62,
-    top: 120,
-    height: 40,
-    lunge: 0,
-  },
-  {
-    name: 'sweep',
-    startup: 11,
-    active: 4,
-    recovery: 20,
-    damage: 80,
-    stun: 24,
-    knockback: 8,
-    reach: 66,
-    top: 25,
-    height: 25,
-    lunge: 0,
-  },
+  { name: 'punch',          startup: 14, active: 4, recovery: 18, damage: 50,  stun: 22, knockback: 5,  reach: 50, top: 100, height: 30, lunge: 0 },
+  { name: 'strong punch',   startup: 28, active: 6, recovery: 30, damage: 90,  stun: 33, knockback: 8,  reach: 58, top: 95,  height: 35, lunge: 3 },
+  { name: 'spin punch',     startup: 24, active: 6, recovery: 22, damage: 110, stun: 24, knockback: 10, reach: 72, top: 95,  height: 36, lunge: 0 },
+  { name: 'uppercut',       startup: 23, active: 6, recovery: 27, damage: 120, stun: 31, knockback: 12, reach: 45, top: 125, height: 50, lunge: 0 },
+  { name: 'low punch',      startup: 18, active: 4, recovery: 18, damage: 70,  stun: 22, knockback: 6,  reach: 55, top: 45,  height: 30, lunge: 0 },
+  { name: 'kick',           startup: 16, active: 4, recovery: 16, damage: 70,  stun: 19, knockback: 6,  reach: 58, top: 60,  height: 30, lunge: 0 },
+  { name: 'front kick',     startup: 19, active: 4, recovery: 25, damage: 100, stun: 28, knockback: 11, reach: 68, top: 70,  height: 34, lunge: 2 },
+  { name: 'back kick',      startup: 22, active: 4, recovery: 26, damage: 115, stun: 28, knockback: 12, reach: 78, top: 85,  height: 36, lunge: 0 },
+  { name: 'high kick',      startup: 20, active: 4, recovery: 20, damage: 105, stun: 22, knockback: 10, reach: 62, top: 120, height: 40, lunge: 0 },
+  { name: 'sweep',          startup: 16, active: 6, recovery: 18, damage: 80,  stun: 22, knockback: 8,  reach: 66, top: 25,  height: 25, lunge: 0 },
   // Air moves (used while off the ground). The kick box reaches below the feet so a jump-in can hit.
-  {
-    name: 'air punch',
-    startup: 5,
-    active: 6,
-    recovery: 8,
-    damage: 60,
-    stun: 16,
-    knockback: 6,
-    reach: 48,
-    top: 105,
-    height: 35,
-    lunge: 0,
-  },
-  {
-    name: 'air kick',
-    startup: 6,
-    active: 7,
-    recovery: 9,
-    damage: 80,
-    stun: 18,
-    knockback: 8,
-    reach: 58,
-    top: 50,
-    height: 55,
-    lunge: 0,
-  },
+  { name: 'air punch',      startup: 8,  active: 6, recovery: 14, damage: 60,  stun: 22, knockback: 6,  reach: 48, top: 105, height: 35, lunge: 0 },
+  { name: 'air kick',       startup: 23, active: 6, recovery: 30, damage: 80,  stun: 34, knockback: 8,  reach: 58, top: 50,  height: 55, lunge: 0 },
   // Q or E + punch: a stepping-in uppercut with the lead hand. Reaches further than the W uppercut (45), less than a kick (58).
-  {
-    name: 'lunge uppercut',
-    startup: 12,
-    active: 4,
-    recovery: 22,
-    damage: 135,
-    stun: 24,
-    knockback: 13,
-    reach: 54,
-    top: 118,
-    height: 46,
-    lunge: 2,
-  },
+  { name: 'lunge uppercut', startup: 18, active: 6, recovery: 33, damage: 135, stun: 35, knockback: 13, reach: 54, top: 118, height: 46, lunge: 2 },
 ];
 export const AIR_PUNCH = 10;
 export const AIR_KICK = 11;
@@ -271,34 +142,34 @@ export const ACT_JUMPSQUAT = 5;
 export const ACT_STEP = 6;
 export const ACT_DASH = 7;
 export const ACT_FLIP = 8;
+export const ACT_LAND = 9;
 
 export type PlayerState = {
-  x: number;
-  y: number;
+  x: number; y: number;
   vy: number;
-  vx: number; // knockback speed in stun, roll speed in a roll
+  vx: number;          // knockback speed in stun, roll speed in a roll
   facing: 1 | -1;
   hp: number;
   act: number;
-  t: number; // ticks into the action (counts DOWN while stunned)
-  hit: 0 | 1; // has the current attack already connected?
-  mv: number; // index into MOVES of the current attack
-  prev: number; // last tick's input
-  buf: number; // ticks left on a remembered click
-  bufLeap: number; // -1 / +1 when the buffered click is a leap kick (kick + Q or E) toward that side, else 0
-  bufMove: number; // the move that click asked for
-  tapCode: number; // the key combination (direction bits) last tapped, 0 for none
-  tapAge: number; // ticks since that tap
-  d1: number; // direction bits 1 tick ago
-  d2: number; // direction bits 2 ticks ago
+  t: number;           // ticks into the action (counts DOWN while stunned)
+  hit: 0 | 1;          // has the current attack already connected?
+  mv: number;          // index into MOVES of the current attack
+  prev: number;        // last tick's input
+  buf: number;         // ticks left on a remembered click
+  bufLeap: number;     // -1 / +1 when the buffered click is a leap kick (kick + Q or E) toward that side, else 0
+  bufMove: number;     // the move that click asked for
+  tapCode: number;     // the key combination (direction bits) last tapped, 0 for none
+  tapAge: number;      // ticks since that tap
+  d1: number;          // direction bits 1 tick ago
+  d2: number;          // direction bits 2 ticks ago
 };
 
 export type GameState = {
   frame: number;
   players: [PlayerState, PlayerState];
-  time: number; // ticks left in the round
-  over: number; // 0 = fighting, otherwise ticks since the round ended
-  winner: number; // -1 = none, 0 or 1 = that player, 2 = draw
+  time: number;        // ticks left in the round
+  over: number;        // 0 = fighting, otherwise ticks since the round ended
+  winner: number;      // -1 = none, 0 or 1 = that player, 2 = draw
   wins: [number, number];
 };
 export type Inputs = [number, number];
@@ -306,22 +177,8 @@ export type Box = { left: number; right: number; top: number; bottom: number };
 
 export function createInitialState(wins: [number, number] = [0, 0]): GameState {
   const base = {
-    y: GROUND_Y,
-    vy: 0,
-    vx: 0,
-    hp: MAX_HP,
-    act: ACT_FREE,
-    t: 0,
-    hit: 0 as const,
-    mv: 0,
-    prev: 0,
-    buf: 0,
-    bufLeap: 0,
-    bufMove: 0,
-    tapCode: 0,
-    tapAge: 255,
-    d1: 0,
-    d2: 0,
+    y: GROUND_Y, vy: 0, vx: 0, hp: MAX_HP, act: ACT_FREE, t: 0, hit: 0 as const,
+    mv: 0, prev: 0, buf: 0, bufLeap: 0, bufMove: 0, tapCode: 0, tapAge: 255, d1: 0, d2: 0,
   };
   return {
     frame: 0,
@@ -336,8 +193,7 @@ export function createInitialState(wins: [number, number] = [0, 0]): GameState {
   };
 }
 
-const clamp = (v: number, min: number, max: number) =>
-  Math.min(Math.max(v, min), max);
+const clamp = (v: number, min: number, max: number) => Math.min(Math.max(v, min), max);
 
 // ---------- boxes ----------
 
@@ -346,7 +202,8 @@ export function isCrouching(p: PlayerState): boolean {
 }
 
 export function hurtbox(p: PlayerState): Box {
-  const h = isCrouching(p) ? CROUCH_H : FIGHTER_H;
+  const rollingLow = p.act === ACT_ROLL && p.t >= ROLL_LOW_FROM && p.t < ROLL_LOW_TO;
+  const h = rollingLow ? ROLL_H : isCrouching(p) ? CROUCH_H : FIGHTER_H;
   return { left: p.x - HALF_W, right: p.x + HALF_W, top: p.y - h, bottom: p.y };
 }
 
@@ -371,12 +228,13 @@ const overlaps = (a: Box, b: Box) =>
 
 /** Turns "kick or punch" plus the held direction into an index into MOVES */
 function moveIndex(kick: boolean, dir: number, facing: number): number {
-  const h = (dir & Input.RIGHT ? 1 : 0) - (dir & Input.LEFT ? 1 : 0);
+  const h = ((dir & Input.RIGHT) ? 1 : 0) - ((dir & Input.LEFT) ? 1 : 0);
   let v = 0; // 0 neutral, 1 forward, 2 back, 3 up, 4 down. Diagonals pick up or down for now.
   if (dir & Input.UP) {
     if (h !== 0 && !kick) return LUNGE_UPPERCUT; // Q or E + punch
-    v = 3; // W + punch / kick: uppercut / high kick
-  } else if (dir & Input.DOWN) v = 4;
+    v = 3;                                       // W + punch / kick: uppercut / high kick
+  }
+  else if (dir & Input.DOWN) v = 4;
   else if (h * facing > 0) v = 1;
   else if (h * facing < 0) v = 2;
   return (kick ? 5 : 0) + v;
@@ -384,27 +242,8 @@ function moveIndex(kick: boolean, dir: number, facing: number): number {
 
 // ---------- one fighter, one tick ----------
 
-function moveFighter(
-  p: PlayerState,
-  other: PlayerState,
-  input: number,
-): PlayerState {
-  let {
-    x,
-    y,
-    vy,
-    vx,
-    facing,
-    act,
-    t,
-    hit,
-    mv,
-    buf,
-    bufLeap,
-    bufMove,
-    tapCode,
-    tapAge,
-  } = p;
+function moveFighter(p: PlayerState, other: PlayerState, input: number): PlayerState {
+  let { x, y, vy, vx, facing, act, t, hit, mv, buf, bufLeap, bufMove, tapCode, tapAge } = p;
   const grounded = y === GROUND_Y;
   const pressed = (bit: number) => (input & bit) !== 0 && (p.prev & bit) === 0;
   const dirNow = input & DIR_MASK;
@@ -417,9 +256,8 @@ function moveFighter(
     bufMove = moveIndex(!punchPressed, dirW, facing);
     // Kick + Q or E (up with left or right) is the leap kick: the kick waits while the fighter springs into the air.
     // Punch + Q or E is the lunge uppercut and W on its own is the plain uppercut / high kick: neither jumps.
-    const h = (dirW & Input.RIGHT ? 1 : 0) - (dirW & Input.LEFT ? 1 : 0);
-    bufLeap =
-      kickPressed && !punchPressed && dirW & Input.UP && h !== 0 ? h : 0;
+    const h = ((dirW & Input.RIGHT) ? 1 : 0) - ((dirW & Input.LEFT) ? 1 : 0);
+    bufLeap = kickPressed && !punchPressed && (dirW & Input.UP) && h !== 0 ? h : 0;
     buf = bufLeap !== 0 ? LEAP_BUFFER : ATTACK_BUFFER;
   } else {
     buf = Math.max(0, buf - 1);
@@ -442,16 +280,14 @@ function moveFighter(
   }
   const sx = dbl & Input.RIGHT ? 1 : -1; // the way the double tap went
   const isDash = (dbl === Input.LEFT || dbl === Input.RIGHT) && sx * facing > 0; // forward only
-  const isRoll =
-    dbl === (Input.DOWN | Input.LEFT) || dbl === (Input.DOWN | Input.RIGHT);
-  const isFlip =
-    dbl === (Input.UP | Input.LEFT) || dbl === (Input.UP | Input.RIGHT);
+  const isRoll = dbl === (Input.DOWN | Input.LEFT) || dbl === (Input.DOWN | Input.RIGHT);
+  const isFlip = dbl === (Input.UP | Input.LEFT) || dbl === (Input.UP | Input.RIGHT);
 
   if (act === ACT_FREE || act === ACT_STEP) {
     if (grounded && isRoll) {
       act = ACT_ROLL;
       t = 0;
-      vx = sx * ROLL_SPEED;
+      vx = sx;
     } else if (grounded && isDash) {
       act = ACT_DASH;
       t = 0;
@@ -472,11 +308,7 @@ function moveFighter(
       act = ACT_JUMPSQUAT;
       t = 0;
       vx = bufLeap * LEAP_SPEED;
-    } else if (
-      grounded &&
-      input & Input.UP &&
-      !(input & (Input.LEFT | Input.RIGHT))
-    ) {
+    } else if (grounded && (input & Input.UP) && !(input & (Input.LEFT | Input.RIGHT))) {
       // W on its own: a jump straight up. (Q and E do nothing by themselves.)
       act = ACT_JUMPSQUAT;
       t = 0;
@@ -496,7 +328,7 @@ function moveFighter(
     } else {
       // On the ground. Holding A or D starts a step; a step plays through and the next one starts if the key is still held.
       if (act === ACT_FREE && !(input & Input.DOWN) && !(input & Input.UP)) {
-        const h = (input & Input.RIGHT ? 1 : 0) - (input & Input.LEFT ? 1 : 0);
+        const h = ((input & Input.RIGHT) ? 1 : 0) - ((input & Input.LEFT) ? 1 : 0);
         if (h !== 0) {
           act = ACT_STEP;
           t = 0;
@@ -526,12 +358,7 @@ function moveFighter(
       act = ACT_ATTACK;
       t = 0;
       hit = 0;
-      mv =
-        bufMove === LUNGE_UPPERCUT
-          ? LUNGE_UPPERCUT
-          : bufMove >= 5 && bufMove <= 9
-            ? 8
-            : 3;
+      mv = bufMove === LUNGE_UPPERCUT ? LUNGE_UPPERCUT : bufMove >= 5 && bufMove <= 9 ? 8 : 3;
       buf = 0;
       vx = 0;
     } else if (t >= (vx !== 0 ? LEAP_SQUAT : JUMP_SQUAT)) {
@@ -541,7 +368,7 @@ function moveFighter(
     }
   } else if (act === ACT_ATTACK) {
     const m = MOVES[mv];
-    if (t < m.startup) x += facing * m.lunge;
+    if (t >= m.startup - LUNGE_TICKS && t < m.startup) x += facing * m.lunge;
     if ((mv === AIR_PUNCH || mv === AIR_KICK) && !grounded) x += vx; // an air attack carries on along the jump
     t++;
     if (t >= m.startup + m.active + m.recovery) {
@@ -559,21 +386,27 @@ function moveFighter(
     }
   } else if (act === ACT_FLIP) {
     t++;
-    if (t === FLIP_SQUAT)
-      vy = FLIP_V; // spring off the ground
-    else if (t > FLIP_SQUAT) x += vx; // then fly along the arc: no steering (vx is 0 again once landed)
+    if (t === FLIP_SQUAT) vy = FLIP_V; // spring off the ground
+    else if (t > FLIP_SQUAT) x += vx;  // then fly along the arc: no steering (vx is 0 again once landed)
     if (t >= FLIP_SQUAT + FLIP_TOTAL) {
       act = ACT_FREE; // standing again
       t = 0;
       vx = 0;
     }
   } else if (act === ACT_ROLL) {
-    if (t < ROLL_MOVE) x += vx;
+    if (t < ROLL.length) x += vx * ROLL[t];
     t++;
     if (t >= ROLL_TOTAL) {
       act = ACT_FREE;
       t = 0;
       vx = 0;
+    }
+  } else if (act === ACT_LAND) {
+    // recovering from a jump. t counts down to 0.
+    t--;
+    if (t <= 0) {
+      act = ACT_FREE;
+      t = 0;
     }
   } else {
     // hitstun or blockstun: pushed back and stuck. t counts down to 0.
@@ -592,7 +425,11 @@ function moveFighter(
   if (y >= GROUND_Y) {
     y = GROUND_Y;
     vy = 0;
-    if (act === ACT_FREE || act === ACT_ATTACK) vx = 0; // landing ends the jump's sideways speed
+    if (act === ACT_FREE && !grounded) {
+      act = ACT_LAND; // landed from a jump: a moment of recovery before acting again
+      t = JUMP_LAND;
+      vx = 0;
+    } else if (act === ACT_FREE || act === ACT_ATTACK) vx = 0; // landing ends the jump's sideways speed
     if (act === ACT_FLIP && t > FLIP_SQUAT) vx = 0; // touched down: the rest of the flip is the landing, with no sliding
   }
   x = clamp(x, HALF_W, WIDTH - HALF_W);
@@ -603,24 +440,8 @@ function moveFighter(
   }
 
   return {
-    x,
-    y,
-    vy,
-    vx,
-    facing,
-    hp: p.hp,
-    act,
-    t,
-    hit,
-    mv,
-    prev: input,
-    buf,
-    bufLeap,
-    bufMove,
-    tapCode,
-    tapAge,
-    d1: dirNow,
-    d2: p.d1,
+    x, y, vy, vx, facing, hp: p.hp, act, t, hit, mv,
+    prev: input, buf, bufLeap, bufMove, tapCode, tapAge, d1: dirNow, d2: p.d1,
   };
 }
 
@@ -655,18 +476,14 @@ function separate(a: PlayerState, b: PlayerState): [PlayerState, PlayerState] {
 
 function canBeHit(d: PlayerState): boolean {
   if (d.act === ACT_HITSTUN) return false; // no combos
-  if (d.act === ACT_ROLL && d.t < ROLL_INVULN) return false;
+  if (d.act === ACT_FLIP && d.t >= FLIP_SAFE_FROM && d.t <= FLIP_SAFE_TO) return false; // flip: invulnerable from frame 1 to 12
   return true;
 }
 
 /** Blocking is the neutral stance: standing or crouching on the ground, not walking or jumping */
 export function isBlocking(d: PlayerState): boolean {
   if (d.act === ACT_BLOCKSTUN) return true;
-  return (
-    d.act === ACT_FREE &&
-    d.y === GROUND_Y &&
-    (d.prev & (Input.LEFT | Input.RIGHT | Input.UP)) === 0
-  );
+  return d.act === ACT_FREE && d.y === GROUND_Y && (d.prev & (Input.LEFT | Input.RIGHT | Input.UP)) === 0;
 }
 
 function landed(attacker: PlayerState, defender: PlayerState): boolean {
@@ -679,15 +496,9 @@ function landed(attacker: PlayerState, defender: PlayerState): boolean {
   );
 }
 
-function takeHit(
-  victim: PlayerState,
-  attacker: PlayerState,
-  blocked: boolean,
-): PlayerState {
+function takeHit(victim: PlayerState, attacker: PlayerState, blocked: boolean): PlayerState {
   const m = MOVES[attacker.mv];
-  const damage = blocked
-    ? Math.floor((m.damage * BLOCK_PERCENT) / 100)
-    : m.damage;
+  const damage = blocked ? Math.floor((m.damage * BLOCK_PERCENT) / 100) : m.damage;
   return {
     ...victim,
     hp: Math.max(0, victim.hp - damage),
@@ -714,9 +525,7 @@ export function step(state: GameState, inputs: Inputs): GameState {
   const m0 = moveFighter(a0, b0, live[0]);
   const m1 = moveFighter(b0, a0, live[1]);
   // A rolling, dashing or flipping fighter passes through the opponent, so nobody is pushed while one is running
-  const passing = [m0.act, m1.act].some(
-    (x) => x === ACT_ROLL || x === ACT_DASH || x === ACT_FLIP,
-  );
+  const passing = [m0.act, m1.act].some((x) => x === ACT_ROLL || x === ACT_DASH || x === ACT_FLIP);
   const [a, b] = passing ? [m0, m1] : separate(m0, m1);
 
   let na = a;
@@ -745,30 +554,13 @@ export function step(state: GameState, inputs: Inputs): GameState {
     if (koA || koB || time <= 0) {
       over = 1;
       winner =
-        koA && koB
-          ? 2
-          : koA
-            ? 1
-            : koB
-              ? 0
-              : na.hp > nb.hp
-                ? 0
-                : nb.hp > na.hp
-                  ? 1
-                  : 2;
+        koA && koB ? 2 : koA ? 1 : koB ? 0 : na.hp > nb.hp ? 0 : nb.hp > na.hp ? 1 : 2;
       if (winner === 0) wins = [wins[0] + 1, wins[1]];
       else if (winner === 1) wins = [wins[0], wins[1] + 1];
     }
   }
 
-  return {
-    frame: state.frame + 1,
-    players: [na, nb],
-    time,
-    over,
-    winner,
-    wins,
-  };
+  return { frame: state.frame + 1, players: [na, nb], time, over, winner, wins };
 }
 
 // The checksum hashes EVERY field of the state
